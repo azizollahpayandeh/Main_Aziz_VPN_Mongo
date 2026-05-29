@@ -9,11 +9,11 @@ import string
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from bson import ObjectId
@@ -37,6 +37,8 @@ PUBLIC_HOST = os.getenv("PUBLIC_HOST", "").strip()
 BOT_BRAND = os.getenv("BOT_BRAND", "AzizVPN").strip() or "AzizVPN"
 CONFIG_PREFIX = os.getenv("CONFIG_PREFIX", "AzizVPN").strip() or "AzizVPN"
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/AzizVPN").strip()
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "@AzizVpn_proxy_openvpn").strip()
+REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "https://t.me/AzizVpn_proxy_openvpn").strip()
 TUTORIAL_URL = os.getenv("TUTORIAL_URL", CHANNEL_URL).strip()
 SUPPORT_URL = os.getenv("SUPPORT_URL", f"tg://user?id={ADMIN_ID}").strip()
 
@@ -84,7 +86,7 @@ for plan in PLAN_DEFS:
 RENEW_TIME_PRICES = {10: 99_000, 20: 179_000, 30: 249_000}
 PRICE_PER_GB_RENEW = int(os.getenv("PRICE_PER_GB_RENEW", "15000"))
 RENEW_VOLUME_OPTIONS = [15, 30, 50, 75, 100, 150, 200]
-FREE_TRIAL_BYTES = 200 * 1024 * 1024
+FREE_TRIAL_BYTES = 100 * 1024 * 1024
 FREE_TRIAL_DAYS = 1
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "900"))
 
@@ -215,6 +217,7 @@ async def get_or_create_user(tg_user) -> Dict[str, Any]:
             "balance": 0,
             "blocked": False,
             "free_trial_used": False,
+            "channel_verified": False,
             "created_at": now,
         })
         await users_col.insert_one(data)
@@ -249,6 +252,38 @@ async def is_blocked(user_id: int) -> bool:
     return bool(user and user.get("blocked"))
 
 
+async def is_channel_member(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL_ID, user_id=int(user_id))
+        return member.status in ("member", "administrator", "creator")
+    except Exception as exc:
+        logger.warning("channel membership check failed for %s: %s", user_id, exc)
+        return False
+
+
+async def is_channel_access_allowed(tg_user) -> bool:
+    if tg_user.id == ADMIN_ID:
+        return True
+    user = await users_col.find_one({"_id": int(tg_user.id)})
+    if not user or not user.get("channel_verified"):
+        return False
+    if not await is_channel_member(tg_user.id):
+        await users_col.update_one(
+            {"_id": int(tg_user.id)},
+            {"$set": {"channel_verified": False, "updated_at": now_utc()}},
+        )
+        return False
+    return True
+
+
+async def mark_channel_verified(user_id: int) -> None:
+    await users_col.update_one(
+        {"_id": int(user_id)},
+        {"$set": {"channel_verified": True, "updated_at": now_utc()}},
+        upsert=True,
+    )
+
+
 async def wallet_change(user_id: int, amount: int, tx_type: str, description: str = "", order_id: Optional[ObjectId] = None) -> int:
     await users_col.update_one(
         {"_id": int(user_id)},
@@ -276,6 +311,13 @@ def nav_rows(back_cb: str = "back:main", include_start: bool = True) -> List[Lis
     if include_start:
         rows.append([InlineKeyboardButton(text="🏠 شروع دوباره", callback_data="back:main")])
     return rows
+
+
+def join_channel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 عضویت در کانال", url=REQUIRED_CHANNEL_URL)],
+        [InlineKeyboardButton(text="✅ تایید عضویت", callback_data="join:check")],
+    ])
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -547,11 +589,54 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 
+class ChannelGateMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = None
+        if isinstance(event, Message):
+            user = event.from_user
+        elif isinstance(event, CallbackQuery):
+            user = event.from_user
+            if event.data == "join:check":
+                return await handler(event, data)
+
+        if user and user.id != ADMIN_ID and not await is_channel_access_allowed(user):
+            await prompt_channel_join(event)
+            return None
+        return await handler(event, data)
+
+
+dp.message.middleware(ChannelGateMiddleware())
+dp.callback_query.middleware(ChannelGateMiddleware())
+
+
 async def send_or_edit(message: Message, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     try:
         await message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML", disable_web_page_preview=True)
     except Exception:
         await message.answer(text, reply_markup=reply_markup, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def show_join_channel(message: Message) -> None:
+    text = (
+        f"👋 به ربات <b>{h(BOT_BRAND)}</b> خوش آمدید!\n\n"
+        "برای استفاده از ربات، ابتدا باید در کانال زیر عضو شوید:\n\n"
+        f'📢 <a href="{h(REQUIRED_CHANNEL_URL)}">عضویت در کانال {h(BOT_BRAND)}</a>\n\n'
+        "پس از عضویت، روی دکمه «✅ تایید عضویت» بزنید."
+    )
+    await send_or_edit(message, text, join_channel_kb())
+
+
+async def prompt_channel_join(event: Any) -> None:
+    if isinstance(event, CallbackQuery):
+        await event.answer("⛔️ ابتدا در کانال عضو شوید و دکمه «تایید عضویت» را بزنید.", show_alert=True)
+        await show_join_channel(event.message)
+        return
+    await show_join_channel(event)
 
 
 async def show_main(message: Message, tg_user) -> None:
@@ -579,7 +664,24 @@ async def ensure_allowed(message_or_call) -> bool:
 
 @dp.message(CommandStart())
 async def on_start(message: Message) -> None:
+    await get_or_create_user(message.from_user)
+    if not await is_channel_access_allowed(message.from_user):
+        await show_join_channel(message)
+        return
     await show_main(message, message.from_user)
+
+
+@dp.callback_query(F.data == "join:check")
+async def cb_join_check(call: CallbackQuery) -> None:
+    if await is_channel_member(call.from_user.id):
+        await mark_channel_verified(call.from_user.id)
+        await call.answer("✅ عضویت شما تأیید شد.", show_alert=True)
+        await show_main(call.message, call.from_user)
+        return
+    await call.answer(
+        "❌ هنوز در کانال عضو نشده‌اید.\nابتدا روی «عضویت در کانال» بزنید، عضو شوید و دوباره «تایید عضویت» را بزنید.",
+        show_alert=True,
+    )
 
 
 @dp.message(Command("admin"))
@@ -1315,7 +1417,7 @@ async def create_trial(call: CallbackQuery) -> None:
         await users_col.update_one({"_id": int(call.from_user.id)}, {"$set": {"free_trial_used": True, "updated_at": now_utc()}})
         await send_or_edit(call.message,
             "🛰 تست رایگان شما ساخته شد.\n\n"
-            "📦 حجم: <b>200 مگابایت</b>\n"
+            "📦 حجم: <b>100 مگابایت</b>\n"
             "⏳ مدت: <b>1 روز</b>\n\n"
             f"<code>{h(result.get('link'))}</code>",
             simple_back_kb(),
