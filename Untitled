@@ -1,0 +1,37 @@
+# Telegram
+BOT_TOKEN=PUT_NEW_TELEGRAM_BOT_TOKEN_HERE
+ADMIN_ID=995380371
+
+# 3X-UI Panel
+XUI_BASE_URL=http://gy.rahyab.top:53275/zTq3XJbzZFHMOy8o9G
+XUI_API_TOKEN=PUT_NEW_3XUI_API_TOKEN_HERE
+INBOUND_ID=1
+PUBLIC_HOST=gy.rahyab.top
+
+# Branding
+BOT_BRAND=AzizVPN
+CONFIG_PREFIX=AzizVPN
+CHANNEL_URL=https://t.me/AzizVPN
+TUTORIAL_URL=https://t.me/AzizVPN/1
+SUPPORT_URL=tg://user?id=995380371
+
+# Payment
+CARD_NUMBER=6037-0000-0000-0000
+CARD_HOLDER=Azizollah
+BANK_NAME=بانک
+MIN_WALLET_CHARGE=200000
+MAX_WALLET_CHARGE=5000000
+
+# MongoDB
+# Local test:
+MONGO_URI=mongodb://localhost:27017/azizvpn_bot
+MONGO_DB_NAME=azizvpn_bot
+
+# Railway/Atlas example:
+# MONGO_URI=mongodb+srv://USER:PASSWORD@cluster0.xxxxx.mongodb.net/azizvpn_bot?retryWrites=true&w=majority
+# MONGO_DB_NAME=azizvpn_bot
+
+# Optional
+PRICE_PER_GB_RENEW=15000
+CLEANUP_INTERVAL_SECONDS=900
+LOG_LEVEL=INFO
