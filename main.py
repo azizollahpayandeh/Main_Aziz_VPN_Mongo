@@ -92,6 +92,26 @@ CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "900"))
 
 SUB_NAME_RE = re.compile(r"^[A-Za-z0-9]{3,32}$")
 
+DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-56f28b.log")
+
+
+def _dbg(hypothesis_id: str, location: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": "56f28b",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
 # =====================================================
 # MongoDB
 # =====================================================
@@ -108,6 +128,16 @@ admin_logs_col = db.admin_logs
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def ensure_aware_dt(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if isinstance(dt, (int, float)):
+        dt = ms_to_dt(int(dt))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def object_id(value: str) -> ObjectId:
@@ -252,12 +282,128 @@ async def is_blocked(user_id: int) -> bool:
     return bool(user and user.get("blocked"))
 
 
-async def is_channel_member(user_id: int) -> bool:
+_channel_chat_id: Any = REQUIRED_CHANNEL_ID
+_channel_bot_can_check = True
+_channel_setup_notified = False
+
+
+def _member_status_str(status: Any) -> str:
+    if hasattr(status, "value"):
+        return str(status.value)
+    return str(status)
+
+
+def _is_bot_channel_access_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "member list is inaccessible" in msg
+        or "chat not found" in msg
+        or "bot is not a member" in msg
+        or "need administrator rights" in msg
+    )
+
+
+async def resolve_required_channel_id() -> Any:
+    global _channel_chat_id
     try:
-        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL_ID, user_id=int(user_id))
-        return member.status in ("member", "administrator", "creator")
+        chat = await bot.get_chat(REQUIRED_CHANNEL_ID)
+        _channel_chat_id = chat.id
+        logger.info("Required channel resolved: %s -> %s", REQUIRED_CHANNEL_ID, _channel_chat_id)
     except Exception as exc:
+        logger.error("Could not resolve required channel %s: %s", REQUIRED_CHANNEL_ID, exc)
+        _channel_chat_id = REQUIRED_CHANNEL_ID
+    return _channel_chat_id
+
+
+async def notify_admin_channel_setup_issue(reason: str) -> None:
+    global _channel_setup_notified
+    if _channel_setup_notified or not ADMIN_ID:
+        return
+    _channel_setup_notified = True
+    text = (
+        "⚠️ <b>تنظیم کانال اجباری ناقص است</b>\n\n"
+        f"کانال: <code>{h(REQUIRED_CHANNEL_ID)}</code>\n"
+        f"ربات: @{h((await bot.get_me()).username or '')}\n\n"
+        f"علت: <code>{h(reason)}</code>\n\n"
+        "برای رفع مشکل:\n"
+        f"1) ربات را در کانال <a href=\"{h(REQUIRED_CHANNEL_URL)}\">اینجا</a> <b>ادمین</b> کنید.\n"
+        "2) دسترسی «مدیریت اعضا / Add Members» را فعال کنید.\n"
+        "3) ربات را ری‌استارت کنید."
+    )
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        logger.exception("failed to notify admin about channel setup")
+
+
+async def verify_channel_bot_setup() -> bool:
+    global _channel_bot_can_check
+    await resolve_required_channel_id()
+    try:
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat_id=_channel_chat_id, user_id=me.id)
+        status = _member_status_str(bot_member.status)
+        if status not in ("administrator", "creator"):
+            _channel_bot_can_check = False
+            reason = f"bot_status={status}"
+            logger.error("Bot is not channel admin (%s). Channel join check will fail.", reason)
+            await notify_admin_channel_setup_issue(reason)
+            return False
+        _channel_bot_can_check = True
+        logger.info("Channel join check ready. bot_status=%s channel=%s", status, _channel_chat_id)
+        return True
+    except Exception as exc:
+        _channel_bot_can_check = False
+        reason = str(exc)
+        logger.error("Channel bot setup invalid: %s", exc)
+        if _is_bot_channel_access_error(exc):
+            await notify_admin_channel_setup_issue(reason)
+        return False
+
+
+async def is_channel_member(user_id: int) -> Optional[bool]:
+    """True=member, False=not member, None=bot cannot verify (setup/permission issue)."""
+    global _channel_bot_can_check
+    # #region agent log
+    _dbg("H3", "is_channel_member:entry", "membership check start", {
+        "user_id": int(user_id),
+        "channel_id": str(_channel_chat_id),
+        "channel_url": REQUIRED_CHANNEL_URL,
+        "bot_can_check": _channel_bot_can_check,
+    })
+    # #endregion
+    if not _channel_bot_can_check:
+        return None
+    try:
+        member = await bot.get_chat_member(chat_id=_channel_chat_id, user_id=int(user_id))
+        status_raw = member.status
+        status_str = _member_status_str(status_raw)
+        allowed = ("member", "administrator", "creator", "restricted")
+        is_member = status_str in allowed
+        # #region agent log
+        _dbg("H2,H4,H5", "is_channel_member:ok", "get_chat_member succeeded", {
+            "user_id": int(user_id),
+            "status_repr": repr(status_raw),
+            "status_str": status_str,
+            "is_member": is_member,
+        })
+        # #endregion
+        return is_member
+    except Exception as exc:
+        # #region agent log
+        _dbg("H1", "is_channel_member:error", "get_chat_member failed", {
+            "user_id": int(user_id),
+            "channel_id": str(_channel_chat_id),
+            "exc_type": type(exc).__name__,
+            "exc_msg": str(exc)[:300],
+            "bot_access_error": _is_bot_channel_access_error(exc),
+        })
+        # #endregion
         logger.warning("channel membership check failed for %s: %s", user_id, exc)
+        if _is_bot_channel_access_error(exc):
+            _channel_bot_can_check = False
+            await notify_admin_channel_setup_issue(str(exc))
+            return None
         return False
 
 
@@ -267,7 +413,10 @@ async def is_channel_access_allowed(tg_user) -> bool:
     user = await users_col.find_one({"_id": int(tg_user.id)})
     if not user or not user.get("channel_verified"):
         return False
-    if not await is_channel_member(tg_user.id):
+    member = await is_channel_member(tg_user.id)
+    if member is None:
+        return False
+    if not member:
         await users_col.update_one(
             {"_id": int(tg_user.id)},
             {"$set": {"channel_verified": False, "updated_at": now_utc()}},
@@ -673,7 +822,25 @@ async def on_start(message: Message) -> None:
 
 @dp.callback_query(F.data == "join:check")
 async def cb_join_check(call: CallbackQuery) -> None:
-    if await is_channel_member(call.from_user.id):
+    # #region agent log
+    _dbg("H5", "cb_join_check:entry", "confirm membership clicked", {"user_id": call.from_user.id})
+    # #endregion
+    member_ok = await is_channel_member(call.from_user.id)
+    # #region agent log
+    _dbg("H5", "cb_join_check:result", "membership decision", {
+        "user_id": call.from_user.id,
+        "member_ok": member_ok,
+        "bot_can_check": _channel_bot_can_check,
+    })
+    # #endregion
+    if member_ok is None:
+        await call.answer(
+            "⚠️ فعلاً امکان بررسی عضویت وجود ندارد.\n"
+            "مدیر در حال تنظیم دسترسی ربات در کانال است. چند دقیقه دیگر دوباره تلاش کنید.",
+            show_alert=True,
+        )
+        return
+    if member_ok:
         await mark_channel_verified(call.from_user.id)
         await call.answer("✅ عضویت شما تأیید شد.", show_alert=True)
         await show_main(call.message, call.from_user)
@@ -1582,7 +1749,8 @@ async def cleanup_expired() -> None:
         used = 0
         if traffic:
             used = int(traffic.get("up", 0)) + int(traffic.get("down", 0))
-        expired_by_time = sub.get("expires_at") and sub["expires_at"] <= now
+        expires_at = ensure_aware_dt(sub.get("expires_at"))
+        expired_by_time = bool(expires_at and expires_at <= now)
         expired_by_volume = used >= int(sub.get("total_bytes", 0)) > 0
         if sub.get("is_trial") and (expired_by_time or expired_by_volume):
             await xui.delete_client(sub["xui_email"])
@@ -1591,7 +1759,10 @@ async def cleanup_expired() -> None:
             await subs_col.update_one({"_id": sub["_id"]}, {"$set": {"status": "expired", "ended_at": now, "updated_at": now}})
 
     delete_before = now - timedelta(days=10)
-    async for sub in subs_col.find({"status": "expired", "is_trial": {"$ne": True}, "ended_at": {"$lte": delete_before}}):
+    async for sub in subs_col.find({"status": "expired", "is_trial": {"$ne": True}}):
+        ended_at = ensure_aware_dt(sub.get("ended_at"))
+        if not ended_at or ended_at > delete_before:
+            continue
         await xui.delete_client(sub["xui_email"])
         await subs_col.update_one({"_id": sub["_id"]}, {"$set": {"status": "deleted", "deleted_at": now, "updated_at": now}})
 
@@ -1604,6 +1775,7 @@ async def main() -> None:
     # Test 3X-UI connection on startup.
     inbound = await xui.get_inbound(INBOUND_ID)
     logger.info("3X-UI connected. Inbound=%s port=%s", inbound.get("remark"), inbound.get("port"))
+    await verify_channel_bot_setup()
     asyncio.create_task(cleanup_loop())
     logger.info("Bot started: %s", BOT_BRAND)
     await dp.start_polling(bot)
