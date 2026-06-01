@@ -92,26 +92,6 @@ CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "900"))
 
 SUB_NAME_RE = re.compile(r"^[A-Za-z0-9]{3,32}$")
 
-DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-56f28b.log")
-
-
-def _dbg(hypothesis_id: str, location: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
-    # #region agent log
-    try:
-        payload = {
-            "sessionId": "56f28b",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
-
 # =====================================================
 # MongoDB
 # =====================================================
@@ -277,6 +257,58 @@ async def clear_state(user_id: int) -> None:
     await states_col.delete_one({"_id": int(user_id)})
 
 
+async def _nav_data(user_id: int) -> Dict[str, Any]:
+    _, data = await get_state(user_id)
+    return data or {}
+
+
+async def nav_reset(user_id: int, screen: str = "main") -> None:
+    state, data = await get_state(user_id)
+    data["nav_stack"] = [screen]
+    if state:
+        await set_state(user_id, state, data)
+    else:
+        await states_col.update_one(
+            {"_id": int(user_id)},
+            {"$set": {"data": data, "updated_at": now_utc()}},
+            upsert=True,
+        )
+
+
+async def nav_push(user_id: int, screen: str) -> None:
+    state, data = await get_state(user_id)
+    stack = list(data.get("nav_stack") or ["main"])
+    if stack[-1] != screen:
+        stack.append(screen)
+    data["nav_stack"] = stack[-25:]
+    if state:
+        await set_state(user_id, state, data)
+    else:
+        await states_col.update_one(
+            {"_id": int(user_id)},
+            {"$set": {"data": data, "updated_at": now_utc()}},
+            upsert=True,
+        )
+
+
+async def nav_pop(user_id: int) -> str:
+    state, data = await get_state(user_id)
+    stack = list(data.get("nav_stack") or ["main"])
+    if len(stack) > 1:
+        stack.pop()
+    target = stack[-1] if stack else "main"
+    data["nav_stack"] = stack if stack else ["main"]
+    if state:
+        await set_state(user_id, state, data)
+    else:
+        await states_col.update_one(
+            {"_id": int(user_id)},
+            {"$set": {"data": data, "updated_at": now_utc()}},
+            upsert=True,
+        )
+    return target
+
+
 async def is_blocked(user_id: int) -> bool:
     user = await users_col.find_one({"_id": int(user_id)})
     return bool(user and user.get("blocked"))
@@ -364,41 +396,13 @@ async def verify_channel_bot_setup() -> bool:
 async def is_channel_member(user_id: int) -> Optional[bool]:
     """True=member, False=not member, None=bot cannot verify (setup/permission issue)."""
     global _channel_bot_can_check
-    # #region agent log
-    _dbg("H3", "is_channel_member:entry", "membership check start", {
-        "user_id": int(user_id),
-        "channel_id": str(_channel_chat_id),
-        "channel_url": REQUIRED_CHANNEL_URL,
-        "bot_can_check": _channel_bot_can_check,
-    })
-    # #endregion
     if not _channel_bot_can_check:
         return None
     try:
         member = await bot.get_chat_member(chat_id=_channel_chat_id, user_id=int(user_id))
-        status_raw = member.status
-        status_str = _member_status_str(status_raw)
-        allowed = ("member", "administrator", "creator", "restricted")
-        is_member = status_str in allowed
-        # #region agent log
-        _dbg("H2,H4,H5", "is_channel_member:ok", "get_chat_member succeeded", {
-            "user_id": int(user_id),
-            "status_repr": repr(status_raw),
-            "status_str": status_str,
-            "is_member": is_member,
-        })
-        # #endregion
-        return is_member
+        status_str = _member_status_str(member.status)
+        return status_str in ("member", "administrator", "creator", "restricted")
     except Exception as exc:
-        # #region agent log
-        _dbg("H1", "is_channel_member:error", "get_chat_member failed", {
-            "user_id": int(user_id),
-            "channel_id": str(_channel_chat_id),
-            "exc_type": type(exc).__name__,
-            "exc_msg": str(exc)[:300],
-            "bot_access_error": _is_bot_channel_access_error(exc),
-        })
-        # #endregion
         logger.warning("channel membership check failed for %s: %s", user_id, exc)
         if _is_bot_channel_access_error(exc):
             _channel_bot_can_check = False
@@ -455,11 +459,38 @@ async def wallet_change(user_id: int, amount: int, tx_type: str, description: st
 # =====================================================
 # Keyboards
 # =====================================================
-def nav_rows(back_cb: str = "back:main", include_start: bool = True) -> List[List[InlineKeyboardButton]]:
-    rows = [[InlineKeyboardButton(text="⬅️ بازگشت", callback_data=back_cb)]]
-    if include_start:
-        rows.append([InlineKeyboardButton(text="🏠 شروع دوباره", callback_data="back:main")])
+def nav_rows(include_home: bool = True) -> List[List[InlineKeyboardButton]]:
+    rows = [[InlineKeyboardButton(text="⬅️ بازگشت", callback_data="nav:back")]]
+    if include_home:
+        rows.append([InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="back:main")])
     return rows
+
+
+def sub_is_active(sub: Dict[str, Any]) -> bool:
+    if sub.get("status") != "active":
+        return False
+    expires_at = ensure_aware_dt(sub.get("expires_at"))
+    if expires_at and expires_at <= now_utc():
+        return False
+    total = int(sub.get("total_bytes", 0) or 0)
+    if total > 0:
+        return True
+    return True
+
+
+def sub_status_line(sub: Dict[str, Any]) -> str:
+    if sub_is_active(sub):
+        return "🟢 <b>فعال</b>"
+    if sub.get("status") == "expired":
+        return "🔴 <b>منقضی شده</b>"
+    return f"⚪️ <b>{h(sub.get('status', 'نامشخص'))}</b>"
+
+
+async def sub_used_bytes(sub: Dict[str, Any]) -> int:
+    traffic = await xui.traffic(sub.get("xui_email"))
+    if not traffic:
+        return 0
+    return int(traffic.get("up", 0)) + int(traffic.get("down", 0))
 
 
 def join_channel_kb() -> InlineKeyboardMarkup:
@@ -479,8 +510,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def simple_back_kb(back_cb: str = "back:main") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=nav_rows(back_cb))
+def simple_back_kb(include_home: bool = True) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=nav_rows(include_home))
 
 
 def duration_kb(auto_renew: bool = False) -> InlineKeyboardMarkup:
@@ -488,7 +519,7 @@ def duration_kb(auto_renew: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏰ 30 روز", callback_data="buy:duration:30"), InlineKeyboardButton(text="⏰ 60 روز", callback_data="buy:duration:60")],
         [InlineKeyboardButton(text=auto, callback_data="buy:toggle_auto")],
-        *nav_rows("back:buy_name"),
+        *nav_rows(),
     ])
 
 
@@ -497,7 +528,7 @@ def plan_kb(days: int) -> InlineKeyboardMarkup:
     for p in PLAN_DEFS:
         price = p["prices"][days]
         rows.append([InlineKeyboardButton(text=f"{p['emoji']} {p['name']} · {days} روز · {p['gb']} گیگ · {fmt_money(price)}", callback_data=f"buy:plan:{p['key']}:{days}")])
-    rows.extend(nav_rows("back:duration"))
+    rows.extend(nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -505,14 +536,14 @@ def payment_kb(order_id: ObjectId) -> InlineKeyboardMarkup:
     oid = str(order_id)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 کیف پول", callback_data=f"pay:wallet:{oid}"), InlineKeyboardButton(text="💸 کارت به کارت", callback_data=f"pay:card:{oid}")],
-        *nav_rows("back:main"),
+        *nav_rows(),
     ])
 
 
-def send_receipt_kb(order_id: ObjectId, back_cb: str = "back:main") -> InlineKeyboardMarkup:
+def send_receipt_kb(order_id: ObjectId) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 ارسال رسید", callback_data=f"receipt:send:{str(order_id)}")],
-        *nav_rows(back_cb),
+        *nav_rows(),
     ])
 
 
@@ -526,7 +557,7 @@ def admin_order_kb(order_id: ObjectId) -> InlineKeyboardMarkup:
 def wallet_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 افزایش موجودی", callback_data="wallet:charge"), InlineKeyboardButton(text="💸 انتقال موجودی", callback_data="wallet:transfer")],
-        *nav_rows("back:main"),
+        *nav_rows(),
     ])
 
 
@@ -534,14 +565,35 @@ def renew_subs_kb(subs: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     rows = []
     for s in subs:
         rows.append([InlineKeyboardButton(text=f"🔹 {s.get('display_name') or s.get('name')} · {short_sub_id(s)}", callback_data=f"renew:select:{str(s['_id'])}")])
-    rows.extend(nav_rows("back:main"))
+    rows.extend(nav_rows())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def subs_list_kb(subs: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for s in subs:
+        name = s.get("display_name") or s.get("name") or "اشتراک"
+        icon = "🟢" if sub_is_active(s) else "🔴"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {name} · {short_sub_id(s)}",
+            callback_data=f"subs:view:{str(s['_id'])}",
+        )])
+    rows.extend(nav_rows())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def sub_detail_kb(sub_id: str, active: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if active:
+        rows.append([InlineKeyboardButton(text="🔗 ساخت لینک اتصال جدید", callback_data=f"subs:newlink:{sub_id}")])
+    rows.extend(nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def renew_options_kb(sub_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏳ تمدید زمانی", callback_data=f"renew:time_menu:{sub_id}"), InlineKeyboardButton(text="📦 تمدید حجمی", callback_data=f"renew:volume_menu:{sub_id}")],
-        *nav_rows("main:renew"),
+        *nav_rows(),
     ])
 
 
@@ -550,7 +602,7 @@ def renew_days_kb(sub_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"10 روز · {fmt_money(RENEW_TIME_PRICES[10])}", callback_data=f"renew:time:{sub_id}:10")],
         [InlineKeyboardButton(text=f"20 روز · {fmt_money(RENEW_TIME_PRICES[20])}", callback_data=f"renew:time:{sub_id}:20")],
         [InlineKeyboardButton(text=f"30 روز · {fmt_money(RENEW_TIME_PRICES[30])}", callback_data=f"renew:time:{sub_id}:30")],
-        *nav_rows(f"renew:select:{sub_id}"),
+        *nav_rows(),
     ])
 
 
@@ -558,13 +610,14 @@ def renew_volume_kb(sub_id: str) -> InlineKeyboardMarkup:
     rows = []
     for gb in RENEW_VOLUME_OPTIONS:
         rows.append([InlineKeyboardButton(text=f"{gb} گیگ · {fmt_money(gb * PRICE_PER_GB_RENEW)}", callback_data=f"renew:volume:{sub_id}:{gb}")])
-    rows.extend(nav_rows(f"renew:select:{sub_id}"))
+    rows.extend(nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 آمار", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="👤 اطلاعات کاربر", callback_data="adm:userinfo")],
         [InlineKeyboardButton(text="➕ افزایش موجودی", callback_data="adm:addbal"), InlineKeyboardButton(text="➖ کاهش موجودی", callback_data="adm:subbal")],
         [InlineKeyboardButton(text="⛔️ بلاک کاربر", callback_data="adm:block"), InlineKeyboardButton(text="✅ آزاد کردن کاربر", callback_data="adm:unblock")],
         [InlineKeyboardButton(text="🔁 تمدید دستی اشتراک", callback_data="adm:renew")],
@@ -677,6 +730,20 @@ class XUIClient:
         except Exception as exc:
             logger.warning("update client failed: %s", exc)
             return False
+
+    async def rotate_client_link(self, email: str, label: str, inbound_id: int = INBOUND_ID) -> str:
+        obj = await self.get_client(email)
+        client = obj.get("client") if isinstance(obj, dict) else obj
+        if not client:
+            raise RuntimeError("کلاینت در پنل پیدا نشد")
+        new_uuid = str(uuid.uuid4())
+        client["id"] = new_uuid
+        await self.request("POST", f"/panel/api/clients/update/{quote(email, safe='')}", client)
+        links = await self.get_links(email)
+        raw_link = links[0] if links else await self.build_fallback_link(
+            email=email, client_uuid=new_uuid, label=label, inbound_id=inbound_id,
+        )
+        return set_link_label(raw_link, label)
 
     async def delete_client(self, email: str) -> bool:
         try:
@@ -791,12 +858,116 @@ async def prompt_channel_join(event: Any) -> None:
 async def show_main(message: Message, tg_user) -> None:
     user = await get_or_create_user(tg_user)
     await clear_state(tg_user.id)
+    await nav_reset(tg_user.id, "main")
     name = user.get("first_name") or user.get("username") or user.get("_id")
     text = (
         f"🌹 کاربر عزیز <b>{h(name)}</b> خوش اومدی به ربات <b>{h(BOT_BRAND)}</b>\n\n"
         "🔸 جهت خرید اشتراک روی دکمه «🛍 خرید اشتراک» ضربه بزنید."
     )
     await send_or_edit(message, text, main_menu_kb())
+
+
+async def render_nav_screen(message: Message, tg_user, screen: str) -> None:
+    uid = int(tg_user.id)
+    if screen == "main":
+        await show_main(message, tg_user)
+        return
+    if screen == "wallet":
+        await show_wallet(message, uid)
+        return
+    if screen == "wallet_charge":
+        await set_state(uid, "wallet_charge_amount", {})
+        await send_or_edit(
+            message,
+            f"💳 مبلغ شارژ کیف پول را به تومان وارد کنید.\nحداقل: {fmt_money(MIN_WALLET_CHARGE)}\nحداکثر: {fmt_money(MAX_WALLET_CHARGE)}",
+            simple_back_kb(),
+        )
+        return
+    if screen == "wallet_transfer":
+        await set_state(uid, "wallet_transfer_target", {})
+        await send_or_edit(message, "💸 شناسه عددی تلگرام کاربر مقصد را وارد کنید:", simple_back_kb())
+        return
+    if screen == "prices":
+        await show_prices(message)
+        return
+    if screen == "subs":
+        await show_subscriptions(message, uid)
+        return
+    if screen.startswith("subs:"):
+        await show_sub_detail(message, uid, screen.split(":", 1)[1])
+        return
+    if screen == "renew":
+        await show_renew_list(message, uid)
+        return
+    if screen.startswith("renew:") and not screen.startswith("renew:time:") and not screen.startswith("renew:vol:"):
+        sid = screen.split(":", 1)[1]
+        sub = await subs_col.find_one({"_id": object_id(sid), "user_id": uid})
+        if sub:
+            text = (
+                f"♻️ تمدید اشتراک <b>{h(sub.get('display_name') or sub.get('name'))}</b>\n\n"
+                f"حجم فعلی: {sub.get('volume_gb')} گیگ\n"
+                f"انقضا: <code>{fmt_dt(sub.get('expires_at'))}</code>\n\n"
+                "نوع تمدید را انتخاب کنید:"
+            )
+            await send_or_edit(message, text, renew_options_kb(sid))
+        return
+    if screen.startswith("renew:time:"):
+        sid = screen.split(":", 2)[2]
+        await send_or_edit(message, "⏳ مدت تمدید زمانی را انتخاب کنید:", renew_days_kb(sid))
+        return
+    if screen.startswith("renew:vol:"):
+        sid = screen.split(":", 2)[2]
+        await send_or_edit(message, "📦 حجم تمدید را انتخاب کنید:", renew_volume_kb(sid))
+        return
+    if screen == "buy_name":
+        await set_state(uid, "buy_name", {})
+        await send_or_edit(message, "🖋 لطفا نام اشتراک خود را وارد کنید:\n\nمثال: <code>Aziz01</code>", simple_back_kb())
+        return
+    if screen == "buy_duration":
+        _, data = await get_state(uid)
+        auto = bool(data.get("auto_renew", False))
+        await set_state(uid, "buy_duration", data)
+        await send_or_edit(
+            message,
+            "🖋 مدت زمان اشتراک خود را انتخاب کنید:\n\n"
+            "💡 با فعال کردن «🎗تمدید خودکار» پس از خرید اشتراک، مدت زمان و ترافیک اشتراک به صورت خودکار تمدید خواهد شد.",
+            duration_kb(auto),
+        )
+        return
+    if screen.startswith("buy_plan:"):
+        days = int(screen.split(":")[-1])
+        _, data = await get_state(uid)
+        await set_state(uid, "buy_plan", data)
+        await send_or_edit(
+            message,
+            "🖋 لطفا اشتراک مورد نظر خود را انتخاب کنید:\n\n💡 تمامی اشتراک‌ها دارای تعداد کاربر نامحدود برای اتصال هستند.",
+            plan_kb(days),
+        )
+        return
+    if screen.startswith("payment:"):
+        oid = object_id(screen.split(":", 1)[1])
+        order = await orders_col.find_one({"_id": oid, "user_id": uid})
+        if not order:
+            await show_main(message, tg_user)
+            return
+        if order.get("kind") in ("renew_time", "renew_volume"):
+            await send_or_edit(
+                message,
+                f"🖋 روش پرداخت تمدید را انتخاب کنید:\n\nمبلغ: <b>{fmt_money(int(order.get('amount', 0)))}</b>",
+                payment_kb(oid),
+            )
+        else:
+            plan_name = order.get("plan_name") or "-"
+            await send_or_edit(
+                message,
+                "🖋 روش پرداخت مورد نظر خود را انتخاب کنید:\n\n"
+                f"🔹 نام اشتراک: <b>{h(order.get('display_name'))}</b>\n"
+                f"📦 پلن: {h(plan_name)} · {order.get('volume_gb')} گیگ · {order.get('duration_days')} روز\n"
+                f"💰 مبلغ: <b>{fmt_money(int(order.get('amount', 0)))}</b>",
+                payment_kb(oid),
+            )
+        return
+    await show_main(message, tg_user)
 
 
 async def ensure_allowed(message_or_call) -> bool:
@@ -822,17 +993,7 @@ async def on_start(message: Message) -> None:
 
 @dp.callback_query(F.data == "join:check")
 async def cb_join_check(call: CallbackQuery) -> None:
-    # #region agent log
-    _dbg("H5", "cb_join_check:entry", "confirm membership clicked", {"user_id": call.from_user.id})
-    # #endregion
     member_ok = await is_channel_member(call.from_user.id)
-    # #region agent log
-    _dbg("H5", "cb_join_check:result", "membership decision", {
-        "user_id": call.from_user.id,
-        "member_ok": member_ok,
-        "bot_can_check": _channel_bot_can_check,
-    })
-    # #endregion
     if member_ok is None:
         await call.answer(
             "⚠️ فعلاً امکان بررسی عضویت وجود ندارد.\n"
@@ -859,6 +1020,13 @@ async def on_admin_cmd(message: Message) -> None:
     await message.answer("👑 پنل مدیریت AzizVPN", reply_markup=admin_menu_kb())
 
 
+@dp.callback_query(F.data == "nav:back")
+async def cb_nav_back(call: CallbackQuery) -> None:
+    await call.answer()
+    screen = await nav_pop(call.from_user.id)
+    await render_nav_screen(call.message, call.from_user, screen)
+
+
 @dp.callback_query(F.data == "back:main")
 async def cb_back_main(call: CallbackQuery) -> None:
     await call.answer()
@@ -883,6 +1051,7 @@ async def cb_main(call: CallbackQuery) -> None:
     await get_or_create_user(call.from_user)
     await call.answer()
     if action == "buy":
+        await nav_push(call.from_user.id, "buy_name")
         await set_state(call.from_user.id, "buy_name", {})
         text = (
             "🖋 لطفا نام اشتراک خود را وارد کنید:\n\n"
@@ -892,12 +1061,16 @@ async def cb_main(call: CallbackQuery) -> None:
         )
         await send_or_edit(call.message, text, simple_back_kb())
     elif action == "wallet":
+        await nav_push(call.from_user.id, "wallet")
         await show_wallet(call.message, call.from_user.id)
     elif action == "prices":
+        await nav_push(call.from_user.id, "prices")
         await show_prices(call.message)
     elif action == "subs":
+        await nav_push(call.from_user.id, "subs")
         await show_subscriptions(call.message, call.from_user.id)
     elif action == "renew":
+        await nav_push(call.from_user.id, "renew")
         await show_renew_list(call.message, call.from_user.id)
     elif action == "trial":
         await create_trial(call)
@@ -925,37 +1098,78 @@ async def show_wallet(message: Message, user_id: int) -> None:
 
 
 async def show_subscriptions(message: Message, user_id: int) -> None:
-    docs = await subs_col.find({"user_id": int(user_id), "status": {"$in": ["active", "expired"]}}).sort("created_at", DESCENDING).to_list(50)
+    docs = await subs_col.find({"user_id": int(user_id), "status": {"$in": ["active", "expired", "deleted"]}}).sort("created_at", DESCENDING).to_list(50)
+    docs = [d for d in docs if d.get("status") in ("active", "expired")]
     if not docs:
-        await send_or_edit(message, "❌ در حال حاضر اکانت فعالی ندارید ابتدا یک اشتراک از بخش اشتراک‌ها تهیه کنید", simple_back_kb())
+        await send_or_edit(message, "❌ در حال حاضر اکانت فعالی ندارید.\nابتدا از بخش «🛍 خرید اشتراک» یک اشتراک تهیه کنید.", simple_back_kb())
         return
-    lines = ["⚡️ <b>اشتراک‌های شما</b>\n"]
-    for s in docs:
-        used = "-"
-        traffic = await xui.traffic(s.get("xui_email"))
-        if traffic:
-            used = fmt_bytes(int(traffic.get("up", 0)) + int(traffic.get("down", 0)))
-        lines.append(
-            f"🔹 <b>{h(s.get('display_name') or s.get('name'))}</b>\n"
-            f"شناسه: <code>{str(s['_id'])}</code>\n"
-            f"وضعیت: <code>{h(s.get('status'))}</code>\n"
-            f"حجم: {s.get('volume_gb')} گیگ | مصرف: {used}\n"
-            f"انقضا: <code>{fmt_dt(s.get('expires_at'))}</code>\n"
-            f"لینک:\n<code>{h(s.get('link') or '')}</code>\n"
-        )
-    await send_or_edit(message, "\n".join(lines), simple_back_kb())
+    active_n = sum(1 for d in docs if sub_is_active(d))
+    lines = [
+        "⚡️ <b>اشتراک‌های شما</b>",
+        "",
+        f"🟢 فعال: <b>{active_n}</b>  ·  🔴 غیرفعال: <b>{len(docs) - active_n}</b>",
+        "",
+        "برای مشاهده جزئیات و لینک اتصال، روی هر اشتراک بزنید:",
+        "",
+    ]
+    for i, s in enumerate(docs, 1):
+        used = await sub_used_bytes(s)
+        total = int(s.get("total_bytes", 0) or 0)
+        used_txt = fmt_bytes(used)
+        total_txt = fmt_bytes(total) if total else f"{s.get('volume_gb', 0)} گیگ"
+        lines.extend([
+            "━━━━━━━━━━━━━━━━",
+            f"<b>{i}.</b> {sub_status_line(s)}  ·  <b>{h(s.get('display_name') or s.get('name'))}</b>",
+            f"📦 حجم: {used_txt} / {total_txt}",
+            f"⏳ انقضا: <code>{fmt_dt(s.get('expires_at'))}</code>",
+            f"📋 پلن: {h(s.get('plan_name') or '-')}",
+            "",
+        ])
+    await send_or_edit(message, "\n".join(lines), subs_list_kb(docs))
+
+
+async def show_sub_detail(message: Message, user_id: int, sub_id: str) -> None:
+    sub = await subs_col.find_one({"_id": object_id(sub_id), "user_id": int(user_id)})
+    if not sub:
+        await send_or_edit(message, "❌ اشتراک پیدا نشد.", simple_back_kb())
+        return
+    await nav_push(user_id, f"subs:{sub_id}")
+    used = await sub_used_bytes(sub)
+    total = int(sub.get("total_bytes", 0) or 0)
+    active = sub_is_active(sub)
+    remain = max(total - used, 0) if total else 0
+    text = (
+        f"{'🟢' if active else '🔴'} <b>{h(sub.get('display_name') or sub.get('name'))}</b>\n"
+        f"{sub_status_line(sub)}\n\n"
+        f"📋 پلن: <b>{h(sub.get('plan_name') or '-')}</b>\n"
+        f"📦 حجم کل: <b>{fmt_bytes(total) if total else str(sub.get('volume_gb', 0)) + ' گیگ'}</b>\n"
+        f"📊 مصرف: <b>{fmt_bytes(used)}</b>\n"
+        f"💾 باقی‌مانده: <b>{fmt_bytes(remain)}</b>\n"
+        f"⏳ تاریخ انقضا: <code>{fmt_dt(sub.get('expires_at'))}</code>\n"
+        f"📅 تاریخ ساخت: <code>{fmt_dt(sub.get('created_at'))}</code>\n"
+        f"🆔 شناسه: <code>{str(sub['_id'])}</code>\n"
+        f"🖥 پنل: <code>{h(sub.get('xui_email') or '-')}</code>\n\n"
+        "🔗 <b>لینک اتصال:</b>\n"
+        f"<code>{h(sub.get('link') or '')}</code>"
+    )
+    await send_or_edit(message, text, sub_detail_kb(sub_id, active))
 
 
 async def show_renew_list(message: Message, user_id: int) -> None:
     limit_date = now_utc() - timedelta(days=7)
-    docs = await subs_col.find({
+    raw = await subs_col.find({
         "user_id": int(user_id),
         "is_trial": {"$ne": True},
-        "$or": [
-            {"status": "active"},
-            {"status": "expired", "expires_at": {"$gte": limit_date}},
-        ],
-    }).sort("created_at", DESCENDING).to_list(30)
+        "status": {"$in": ["active", "expired"]},
+    }).sort("created_at", DESCENDING).to_list(50)
+    docs = []
+    for d in raw:
+        if d.get("status") == "active":
+            docs.append(d)
+            continue
+        exp = ensure_aware_dt(d.get("expires_at"))
+        if exp and exp >= limit_date:
+            docs.append(d)
     if not docs:
         text = (
             "❌ شما اشتراکی که واجد شرایط تمدید باشد ندارید.\n\n"
@@ -968,28 +1182,50 @@ async def show_renew_list(message: Message, user_id: int) -> None:
 
 
 # =====================================================
+# Subscriptions detail / new link
+# =====================================================
+@dp.callback_query(F.data.startswith("subs:view:"))
+async def cb_subs_view(call: CallbackQuery) -> None:
+    await call.answer()
+    sid = call.data.split(":", 2)[2]
+    await show_sub_detail(call.message, call.from_user.id, sid)
+
+
+@dp.callback_query(F.data.startswith("subs:newlink:"))
+async def cb_subs_newlink(call: CallbackQuery) -> None:
+    await call.answer("در حال ساخت لینک جدید...")
+    sid = call.data.split(":", 2)[2]
+    sub = await subs_col.find_one({"_id": object_id(sid), "user_id": int(call.from_user.id)})
+    if not sub:
+        await call.answer("اشتراک پیدا نشد", show_alert=True)
+        return
+    if not sub_is_active(sub):
+        await call.answer("این اشتراک فعال نیست.", show_alert=True)
+        return
+    label = sub.get("display_name") or sub.get("name") or CONFIG_PREFIX
+    try:
+        new_link = await xui.rotate_client_link(sub["xui_email"], label)
+        client_obj = await xui.get_client(sub["xui_email"])
+        new_uuid = None
+        if client_obj:
+            c = client_obj.get("client") if isinstance(client_obj, dict) else client_obj
+            if c:
+                new_uuid = c.get("id")
+        patch = {"link": new_link, "updated_at": now_utc()}
+        if new_uuid:
+            patch["uuid"] = new_uuid
+        await subs_col.update_one({"_id": sub["_id"]}, {"$set": patch})
+        sub["link"] = new_link
+        await call.answer("✅ لینک جدید ساخته شد.", show_alert=True)
+        await show_sub_detail(call.message, call.from_user.id, sid)
+    except Exception as exc:
+        logger.exception("new link failed")
+        await call.answer(f"خطا: {exc}", show_alert=True)
+
+
+# =====================================================
 # Buying flow
 # =====================================================
-@dp.callback_query(F.data == "back:buy_name")
-async def cb_back_buy_name(call: CallbackQuery) -> None:
-    await call.answer()
-    await set_state(call.from_user.id, "buy_name", {})
-    await send_or_edit(call.message, "🖋 لطفا نام اشتراک خود را وارد کنید:\n\nمثال: <code>Aziz01</code>", simple_back_kb())
-
-
-@dp.callback_query(F.data == "back:duration")
-async def cb_back_duration(call: CallbackQuery) -> None:
-    await call.answer()
-    state, data = await get_state(call.from_user.id)
-    auto = bool(data.get("auto_renew", False))
-    await set_state(call.from_user.id, "buy_duration", data)
-    await send_or_edit(call.message,
-        "🖋 مدت زمان اشتراک خود را انتخاب کنید:\n\n"
-        "💡 با فعال کردن «🎗تمدید خودکار» پس از خرید اشتراک، مدت زمان و ترافیک اشتراک به صورت خودکار تمدید خواهد شد.",
-        duration_kb(auto),
-    )
-
-
 @dp.callback_query(F.data == "buy:toggle_auto")
 async def cb_toggle_auto(call: CallbackQuery) -> None:
     await call.answer()
@@ -1009,9 +1245,11 @@ async def cb_buy_duration(call: CallbackQuery) -> None:
     days = int(call.data.split(":")[-1])
     state, data = await get_state(call.from_user.id)
     if not data.get("sub_name"):
-        await cb_back_buy_name(call)
+        await render_nav_screen(call.message, call.from_user, "buy_name")
         return
+    await nav_push(call.from_user.id, "buy_duration")
     data["duration_days"] = days
+    await nav_push(call.from_user.id, f"buy_plan:{days}")
     await set_state(call.from_user.id, "buy_plan", data)
     text = "🖋 لطفا اشتراک مورد نظر خود را انتخاب کنید:\n\n💡 تمامی اشتراک‌ها دارای تعداد کاربر نامحدود برای اتصال هستند."
     await send_or_edit(call.message, text, plan_kb(days))
@@ -1028,7 +1266,7 @@ async def cb_buy_plan(call: CallbackQuery) -> None:
         return
     state, data = await get_state(call.from_user.id)
     if not data.get("sub_name"):
-        await cb_back_buy_name(call)
+        await render_nav_screen(call.message, call.from_user, "buy_name")
         return
     order = {
         "user_id": int(call.from_user.id),
@@ -1047,6 +1285,7 @@ async def cb_buy_plan(call: CallbackQuery) -> None:
         "updated_at": now_utc(),
     }
     res = await orders_col.insert_one(order)
+    await nav_push(call.from_user.id, f"payment:{res.inserted_id}")
     await clear_state(call.from_user.id)
     text = (
         "🖋 روش پرداخت مورد نظر خود را انتخاب کنید:\n\n"
@@ -1078,7 +1317,7 @@ async def cb_pay_wallet(call: CallbackQuery) -> None:
         )
         await send_or_edit(call.message, text, InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 شارژ کیف پول", callback_data="wallet:charge")],
-            *nav_rows("back:main"),
+            *nav_rows(),
         ]))
         return
     await wallet_change(call.from_user.id, -amount, "purchase", f"payment for order {oid}", oid)
@@ -1086,7 +1325,16 @@ async def cb_pay_wallet(call: CallbackQuery) -> None:
     try:
         sub = await fulfill_order(order, approved_by=call.from_user.id)
         # Single message only; this fixes the duplicate wallet-config message.
-        await send_or_edit(call.message, config_ready_text(sub, "✅ پرداخت از کیف پول انجام شد و اشتراک شما ساخته شد."), simple_back_kb())
+        header = "✅ پرداخت از کیف پول انجام شد."
+        if order.get("kind") == "purchase":
+            header += " اشتراک شما ساخته شد."
+        elif str(order.get("kind", "")).startswith("renew"):
+            header += " تمدید اعمال شد."
+        sid = str(sub.get("_id", ""))
+        kb = sub_detail_kb(sid, sub_is_active(sub)) if sid else simple_back_kb()
+        await send_or_edit(call.message, config_ready_text(sub, header), kb)
+        if sid:
+            await nav_push(call.from_user.id, f"subs:{sid}")
     except Exception as exc:
         logger.exception("wallet fulfill failed")
         await wallet_change(call.from_user.id, amount, "refund", f"refund failed order {oid}", oid)
@@ -1103,7 +1351,8 @@ async def cb_pay_card(call: CallbackQuery) -> None:
         await call.answer("سفارش پیدا نشد", show_alert=True)
         return
     await orders_col.update_one({"_id": oid}, {"$set": {"payment_method": "card", "status": "pending_receipt", "updated_at": now_utc()}})
-    await send_or_edit(call.message, card_payment_text(order), send_receipt_kb(oid, "back:main"))
+    await nav_push(call.from_user.id, f"payment:{oid}")
+    await send_or_edit(call.message, card_payment_text(order), send_receipt_kb(oid))
 
 
 @dp.callback_query(F.data.startswith("receipt:send:"))
@@ -1192,6 +1441,7 @@ async def on_text(message: Message) -> None:
             await message.answer("❌ نام اشتراک باید حداقل 3 کاراکتر و فقط شامل حروف و اعداد انگلیسی باشد.\nمثال: <code>Aziz01</code>", parse_mode="HTML")
             return
         data = {"sub_name": name, "auto_renew": False}
+        await nav_push(message.from_user.id, "buy_duration")
         await set_state(message.from_user.id, "buy_duration", data)
         await message.answer(
             "🖋 مدت زمان اشتراک خود را انتخاب کنید:\n\n"
@@ -1221,7 +1471,8 @@ async def on_text(message: Message) -> None:
         res = await orders_col.insert_one(order)
         await clear_state(message.from_user.id)
         order["_id"] = res.inserted_id
-        await message.answer(card_payment_text(order), reply_markup=send_receipt_kb(res.inserted_id, "main:wallet"), parse_mode="HTML")
+        await nav_push(message.from_user.id, f"payment:{res.inserted_id}")
+        await message.answer(card_payment_text(order), reply_markup=send_receipt_kb(res.inserted_id), parse_mode="HTML")
         return
 
     if state == "wallet_transfer_target":
@@ -1234,7 +1485,7 @@ async def on_text(message: Message) -> None:
             await message.answer("❌ انتقال به خودتان ممکن نیست.", reply_markup=simple_back_kb())
             return
         await set_state(message.from_user.id, "wallet_transfer_amount", {"target_id": target_id})
-        await message.answer("💸 مبلغ انتقال را به تومان وارد کنید:", reply_markup=simple_back_kb("main:wallet"))
+        await message.answer("💸 مبلغ انتقال را به تومان وارد کنید:", reply_markup=simple_back_kb())
         return
 
     if state == "wallet_transfer_amount":
@@ -1411,7 +1662,7 @@ async def fulfill_order(order: Dict[str, Any], approved_by: int) -> Dict[str, An
         add_bytes = gb_to_bytes(int(order.get("volume_gb") or 0))
         ok = await xui.bulk_adjust([sub["xui_email"]], add_days=add_days, add_bytes=add_bytes)
         now = now_utc()
-        new_expires = sub.get("expires_at") or now
+        new_expires = ensure_aware_dt(sub.get("expires_at")) or now
         if new_expires < now:
             new_expires = now
         if add_days:
@@ -1476,14 +1727,16 @@ async def cb_admin_reject(call: CallbackQuery) -> None:
 async def cb_wallet_charge(call: CallbackQuery) -> None:
     await call.answer()
     await set_state(call.from_user.id, "wallet_charge_amount", {})
-    await send_or_edit(call.message, f"💳 مبلغ شارژ کیف پول را به تومان وارد کنید.\nحداقل: {fmt_money(MIN_WALLET_CHARGE)}\nحداکثر: {fmt_money(MAX_WALLET_CHARGE)}", simple_back_kb("main:wallet"))
+    await nav_push(call.from_user.id, "wallet_charge")
+    await send_or_edit(call.message, f"💳 مبلغ شارژ کیف پول را به تومان وارد کنید.\nحداقل: {fmt_money(MIN_WALLET_CHARGE)}\nحداکثر: {fmt_money(MAX_WALLET_CHARGE)}", simple_back_kb())
 
 
 @dp.callback_query(F.data == "wallet:transfer")
 async def cb_wallet_transfer(call: CallbackQuery) -> None:
     await call.answer()
     await set_state(call.from_user.id, "wallet_transfer_target", {})
-    await send_or_edit(call.message, "💸 شناسه عددی تلگرام کاربر مقصد را وارد کنید:", simple_back_kb("main:wallet"))
+    await nav_push(call.from_user.id, "wallet_transfer")
+    await send_or_edit(call.message, "💸 شناسه عددی تلگرام کاربر مقصد را وارد کنید:", simple_back_kb())
 
 
 # =====================================================
@@ -1493,6 +1746,7 @@ async def cb_wallet_transfer(call: CallbackQuery) -> None:
 async def cb_renew_select(call: CallbackQuery) -> None:
     await call.answer()
     sid = call.data.split(":")[-1]
+    await nav_push(call.from_user.id, f"renew:{sid}")
     sub = await subs_col.find_one({"_id": object_id(sid), "user_id": int(call.from_user.id)})
     if not sub:
         await call.answer("اشتراک پیدا نشد", show_alert=True)
@@ -1510,6 +1764,7 @@ async def cb_renew_select(call: CallbackQuery) -> None:
 async def cb_renew_time_menu(call: CallbackQuery) -> None:
     await call.answer()
     sid = call.data.split(":")[-1]
+    await nav_push(call.from_user.id, f"renew:time:{sid}")
     await send_or_edit(call.message, "⏳ مدت تمدید زمانی را انتخاب کنید:", renew_days_kb(sid))
 
 
@@ -1517,6 +1772,7 @@ async def cb_renew_time_menu(call: CallbackQuery) -> None:
 async def cb_renew_vol_menu(call: CallbackQuery) -> None:
     await call.answer()
     sid = call.data.split(":")[-1]
+    await nav_push(call.from_user.id, f"renew:vol:{sid}")
     await send_or_edit(call.message, "📦 حجم تمدید را انتخاب کنید:", renew_volume_kb(sid))
 
 
@@ -1525,6 +1781,7 @@ async def cb_renew_time(call: CallbackQuery) -> None:
     await call.answer()
     _, _, sid, days_s = call.data.split(":")
     oid = await create_order_for_renew(call.from_user.id, sid, "renew_time", days=int(days_s))
+    await nav_push(call.from_user.id, f"payment:{oid}")
     order = await orders_col.find_one({"_id": oid})
     await send_or_edit(call.message, f"🖋 روش پرداخت تمدید زمانی را انتخاب کنید:\n\nمبلغ: <b>{fmt_money(order['amount'])}</b>", payment_kb(oid))
 
@@ -1534,6 +1791,7 @@ async def cb_renew_volume(call: CallbackQuery) -> None:
     await call.answer()
     _, _, sid, gb_s = call.data.split(":")
     oid = await create_order_for_renew(call.from_user.id, sid, "renew_volume", gb=int(gb_s))
+    await nav_push(call.from_user.id, f"payment:{oid}")
     order = await orders_col.find_one({"_id": oid})
     await send_or_edit(call.message, f"🖋 روش پرداخت تمدید حجمی را انتخاب کنید:\n\nحجم: {gb_s} گیگ\nمبلغ: <b>{fmt_money(order['amount'])}</b>", payment_kb(oid))
 
@@ -1644,9 +1902,95 @@ async def cb_admin_panel(call: CallbackQuery) -> None:
             "یا با شناسه دیتابیس اشتراک.",
             admin_cancel_kb(),
         )
+    elif action == "userinfo":
+        await set_state(ADMIN_ID, "admin_user_lookup", {})
+        await send_or_edit(
+            call.message,
+            "👤 <b>اطلاعات کاربر</b>\n\nشناسه عددی تلگرام کاربر را بفرست:",
+            admin_cancel_kb(),
+        )
+
+
+async def build_admin_user_report(user_id: int) -> str:
+    user = await users_col.find_one({"_id": int(user_id)}) or {}
+    subs = await subs_col.find({"user_id": int(user_id)}).sort("created_at", DESCENDING).to_list(100)
+    orders = await orders_col.find({"user_id": int(user_id)}).sort("created_at", DESCENDING).to_list(100)
+    txs = await wallet_col.find({"user_id": int(user_id)}).sort("created_at", DESCENDING).to_list(50)
+
+    lines = [
+        f"👤 <b>پروفایل کاربر</b> <code>{user_id}</code>",
+        "",
+        f"📝 نام: <b>{h(user.get('first_name') or '-')}</b>",
+        f"🔗 یوزرنیم: @{h(user.get('username') or '-')}",
+        f"💰 موجودی: <b>{fmt_money(int(user.get('balance', 0)))}</b>",
+        f"⛔️ بلاک: <code>{'بله' if user.get('blocked') else 'خیر'}</code>",
+        f"🛰 تست رایگان: <code>{'استفاده شده' if user.get('free_trial_used') else 'خیر'}</code>",
+        f"✅ کانال: <code>{'تایید شده' if user.get('channel_verified') else 'خیر'}</code>",
+        f"📅 عضویت در ربات: <code>{fmt_dt(user.get('created_at'))}</code>",
+        "",
+        f"⚡️ <b>اشتراک‌ها ({len(subs)})</b>",
+    ]
+    if not subs:
+        lines.append("— بدون اشتراک —")
+    for i, s in enumerate(subs[:15], 1):
+        lines.extend([
+            "",
+            f"<b>{i}.</b> {sub_status_line(s)} · <b>{h(s.get('display_name') or s.get('name'))}</b>",
+            f"پلن: {h(s.get('plan_name') or '-')} | حجم: {s.get('volume_gb', 0)} گیگ",
+            f"انقضا: <code>{fmt_dt(s.get('expires_at'))}</code> | ساخت: <code>{fmt_dt(s.get('created_at'))}</code>",
+            f"پنل: <code>{h(s.get('xui_email') or '-')}</code>",
+            f"ID: <code>{str(s['_id'])}</code>",
+        ])
+    if len(subs) > 15:
+        lines.append(f"\n... و {len(subs) - 15} اشتراک دیگر")
+
+    lines.extend(["", f"🧾 <b>سفارش‌ها ({len(orders)})</b>"])
+    if not orders:
+        lines.append("— بدون سفارش —")
+    for i, o in enumerate(orders[:15], 1):
+        lines.extend([
+            "",
+            f"<b>{i}.</b> <code>{h(o.get('kind'))}</code> | <code>{h(o.get('status'))}</code>",
+            f"مبلغ: {fmt_money(int(o.get('amount', 0)))} | پرداخت: <code>{h(o.get('payment_method') or '-')}</code>",
+            f"تاریخ: <code>{fmt_dt(o.get('created_at'))}</code>",
+        ])
+        if o.get("plan_name"):
+            lines.append(f"پلن: {h(o.get('plan_name'))} · {o.get('volume_gb', 0)}G · {o.get('duration_days', 0)} روز")
+    if len(orders) > 15:
+        lines.append(f"\n... و {len(orders) - 15} سفارش دیگر")
+
+    lines.extend(["", f"💳 <b>تراکنش‌های کیف پول ({len(txs)})</b>"])
+    if not txs:
+        lines.append("— بدون تراکنش —")
+    for i, t in enumerate(txs[:10], 1):
+        sign = "+" if int(t.get("amount", 0)) >= 0 else ""
+        lines.append(
+            f"{i}. {sign}{fmt_money(int(t.get('amount', 0)))} · <code>{h(t.get('type'))}</code> · {fmt_dt(t.get('created_at'))}"
+        )
+    return "\n".join(lines)
 
 
 async def handle_admin_state_text(message: Message, state: str, data: Dict[str, Any]) -> None:
+    if state == "admin_user_lookup":
+        uid_text = re.sub(r"[^0-9]", "", message.text)
+        if not uid_text:
+            await message.answer("❌ شناسه عددی معتبر بفرست.", reply_markup=admin_cancel_kb())
+            return
+        uid = int(uid_text)
+        await users_col.update_one(
+            {"_id": uid},
+            {"$setOnInsert": {"balance": 0, "blocked": False, "free_trial_used": False, "channel_verified": False, "created_at": now_utc()}},
+            upsert=True,
+        )
+        report = await build_admin_user_report(uid)
+        await clear_state(ADMIN_ID)
+        if len(report) > 4000:
+            for chunk_start in range(0, len(report), 3800):
+                await message.answer(report[chunk_start:chunk_start + 3800], parse_mode="HTML")
+        else:
+            await message.answer(report, parse_mode="HTML", reply_markup=admin_menu_kb())
+        return
+
     if state == "admin_reject_reason":
         oid = object_id(data.get("order_id"))
         reason = message.text.strip()
@@ -1709,7 +2053,7 @@ async def handle_admin_state_text(message: Message, state: str, data: Dict[str, 
             return
         add_bytes = gb_to_bytes(gb)
         await xui.bulk_adjust([sub["xui_email"]], add_days=days, add_bytes=add_bytes)
-        base_exp = sub.get("expires_at") or now_utc()
+        base_exp = ensure_aware_dt(sub.get("expires_at")) or now_utc()
         if base_exp < now_utc():
             base_exp = now_utc()
         new_exp = base_exp + timedelta(days=days)
