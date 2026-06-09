@@ -1,4 +1,3 @@
-# AzizVPN 3X-UI traffic baseline fix v2
 import asyncio
 import html
 import json
@@ -487,68 +486,38 @@ def sub_status_line(sub: Dict[str, Any]) -> str:
     return f"⚪️ <b>{h(sub.get('status', 'نامشخص'))}</b>"
 
 
-def normalize_used_with_baseline(sub: Dict[str, Any], raw_used: int) -> Tuple[int, int, Dict[str, Any]]:
-    """
-    Convert raw 3X-UI traffic to the usage shown to the user.
-
-    Why this exists:
-    some 3X-UI builds may return stale counters or an old counter after a
-    client is recreated.  For every new subscription we save the panel counter
-    at creation time as a baseline. Displayed usage is:
-        current_raw_counter - creation_baseline
-    """
-    raw = max(int(raw_used or 0), 0)
-    baseline = max(int(sub.get("traffic_baseline_used_bytes", 0) or 0), 0)
-    patch: Dict[str, Any] = {}
-
-    # If the panel counter was reset manually, never show negative usage.
-    if baseline and raw < baseline:
-        baseline = raw
-        patch["traffic_baseline_used_bytes"] = baseline
-
-    used = max(raw - baseline, 0)
-    return used, raw, patch
-
-
 async def sub_used_bytes(sub: Dict[str, Any]) -> int:
     """
     Read usage from 3X-UI and cache it in MongoDB.
-
-    Important fix:
-    - When 3X-UI is reachable, trust the current resolved client traffic.
-      Do NOT keep an old higher cache forever, because a previous bug could
-      cache the whole inbound traffic and show impossible values like
-      68 GB used on a fresh 15 GB plan.
-    - When 3X-UI is unavailable, show the last cached displayed usage.
+    If the panel/API is temporarily unavailable, keep the last non-zero cached
+    value instead of showing a fake 0 B to the user.
     """
-    raw_used_opt = await xui.traffic_for_sub(sub)
+    used_opt = await xui.traffic_for_sub(sub)
     cached = int(sub.get("used_bytes_cache", 0) or 0)
 
-    if raw_used_opt is None:
+    if used_opt is None:
         return cached
 
-    used, raw_used, extra_patch = normalize_used_with_baseline(sub, int(raw_used_opt or 0))
+    used = max(int(used_opt or 0), cached)
 
+    # Do not let a temporary zero/older endpoint overwrite a higher cached value.
     if sub.get("_id"):
-        patch = {
-            "used_bytes_cache": used,
-            "raw_used_bytes_cache": raw_used,
-            "traffic_updated_at": now_utc(),
-            "updated_at": now_utc(),
-            **extra_patch,
-        }
-        await subs_col.update_one({"_id": sub["_id"]}, {"$set": patch})
-        sub.update(patch)
-
+        await subs_col.update_one(
+            {"_id": sub["_id"]},
+            {"$set": {
+                "used_bytes_cache": used,
+                "traffic_updated_at": now_utc(),
+                "updated_at": now_utc(),
+            }},
+        )
     return used
-
 
 async def sync_subscription_from_xui(sub: Dict[str, Any]) -> Dict[str, Any]:
     """
     Best-effort sync of Mongo subscription data from the panel.
 
-    This keeps total/expiry/uuid aligned, but usage is normalized by baseline
-    so a stale panel/inbound counter cannot be shown as a user's real usage.
+    This fixes cases where the panel has the correct total/expiry/uuid/usage
+    but MongoDB still has old or incomplete values.
     """
     email = str(sub.get("xui_email") or "").strip()
     if not email or not sub.get("_id"):
@@ -580,17 +549,16 @@ async def sync_subscription_from_xui(sub: Dict[str, Any]) -> Dict[str, Any]:
         patch["sub_id"] = snap["sub_id"]
 
     if snap.get("traffic_found"):
-        used, raw_used, extra_patch = normalize_used_with_baseline(sub, int(snap.get("used_bytes") or 0))
+        used = max(int(snap.get("used_bytes") or 0), int(sub.get("used_bytes_cache", 0) or 0))
         patch["used_bytes_cache"] = used
-        patch["raw_used_bytes_cache"] = raw_used
         patch["traffic_updated_at"] = now_utc()
-        patch.update(extra_patch)
 
     if len(patch) > 1:
         await subs_col.update_one({"_id": sub["_id"]}, {"$set": patch})
         sub.update(patch)
 
     return sub
+
 
 
 def join_channel_kb() -> InlineKeyboardMarkup:
@@ -920,13 +888,8 @@ class XUIClient:
     @staticmethod
     def _traffic_candidates_from_tree(node: Any, email: str, depth: int = 0) -> List[Dict[str, Any]]:
         """
-        Recursively find traffic objects that match the target email.
-
-        Critical fix:
-        Never accept a traffic object without an email while scanning big trees
-        such as /inbounds/list.  Inbound objects can also have up/down counters,
-        and accepting those email-less counters makes the bot show the whole
-        inbound traffic as one user's usage.
+        Recursively find traffic objects that either match the target email or,
+        in direct traffic endpoint responses, do not carry an email field.
         """
         if depth > 10:
             return []
@@ -935,14 +898,10 @@ class XUIClient:
 
         if isinstance(node, dict):
             parsed = XUIClient._parse_traffic_obj(node)
-            node_email = (
-                (node.get("traffic") or {}).get("email")
-                if isinstance(node.get("traffic"), dict)
-                else node.get("email")
-            )
+            node_email = node.get("email") or (node.get("traffic") or {}).get("email") if isinstance(node.get("traffic"), dict) else node.get("email")
             if parsed is not None:
                 parsed_email = parsed.get("email") or node_email
-                if parsed_email and XUIClient._email_matches(parsed_email, email):
+                if not parsed_email or XUIClient._email_matches(parsed_email, email):
                     found.append(parsed)
 
             for value in node.values():
@@ -1181,7 +1140,7 @@ class XUIClient:
         encoded = quote(email, safe="")
         candidates: List[Dict[str, Any]] = []
 
-        # Direct client-traffic endpoints. We collect candidates, not return immediately.
+        # Direct traffic endpoints. We collect, not return immediately.
         attempts: List[Tuple[str, str]] = [
             ("inbounds.getClientTraffics", f"/panel/api/inbounds/getClientTraffics/{encoded}"),
             ("clients.traffic", f"/panel/api/clients/traffic/{encoded}"),
@@ -1190,32 +1149,18 @@ class XUIClient:
         for label, path in attempts:
             try:
                 data = await self.request("GET", path)
-                obj = data.get("obj", data)
-
-                # Direct endpoints may return one client traffic object without
-                # repeating email. Accept email-less traffic ONLY here.
-                direct = self._parse_traffic_obj(obj)
-                if direct is not None:
-                    direct_email = direct.get("email") or (obj.get("email") if isinstance(obj, dict) else None)
-                    if not direct_email or self._email_matches(direct_email, email):
-                        candidates.append(direct)
-
-                # Recursive scanning must only accept objects with matching email.
-                found = self._traffic_candidates_from_tree(obj, email)
+                found = self._traffic_candidates_from_tree(data.get("obj", data), email)
                 if found:
                     candidates.extend(found)
-
-                if direct is not None or found:
-                    best = self._best_traffic([direct, *found])
-                    if best:
-                        logger.info(
-                            "traffic candidate via %s for %s: used=%s up=%s down=%s",
-                            label, email, self.traffic_used_bytes(best), best.get("up"), best.get("down"),
-                        )
+                    best = self._best_traffic(found)
+                    logger.info(
+                        "traffic candidate via %s for %s: used=%s up=%s down=%s",
+                        label, email, self.traffic_used_bytes(best), best.get("up"), best.get("down"),
+                    )
             except Exception as exc:
                 logger.warning("traffic fetch failed via %s for %s: %s", label, email, exc)
 
-        # Paged/list clients endpoints. Only matching-email objects are accepted.
+        # Paged/list clients endpoints.
         for label, path in (
             ("clients.list.paged", f"/panel/api/clients/list/paged?search={encoded}&pageSize=50&page=1"),
             ("clients.list", "/panel/api/clients/list"),
@@ -1233,8 +1178,7 @@ class XUIClient:
             except Exception as exc:
                 logger.warning("traffic fetch failed via %s for %s: %s", label, email, exc)
 
-        # Inbound clientStats are usually reliable, but do NOT accept the inbound's
-        # own up/down counters because they belong to the whole inbound, not user.
+        # Inbound stats are often the most reliable source.
         try:
             inbounds = [await self.get_inbound(inbound_id)]
             try:
@@ -1251,6 +1195,7 @@ class XUIClient:
                         if parsed is not None:
                             candidates.append(parsed)
 
+                # Some list responses put traffic next to client in settings/client objects.
                 for client in self._settings_clients(inbound):
                     if self._email_matches(client.get("email"), email):
                         candidates.extend(self._traffic_candidates_from_tree(client, email))
@@ -2423,13 +2368,6 @@ async def create_trial(call: CallbackQuery) -> None:
             inbound_id=INBOUND_ID,
             label=display_name,
         )
-
-        try:
-            baseline_used = int(await xui.traffic_for_sub({"xui_email": email}) or 0)
-        except Exception as exc:
-            logger.warning("could not read trial traffic baseline for %s: %s", email, exc)
-            baseline_used = 0
-
         sub = {
             "user_id": int(call.from_user.id),
             "name": sub_name,
@@ -2447,10 +2385,6 @@ async def create_trial(call: CallbackQuery) -> None:
             "status": "active",
             "is_trial": True,
             "auto_renew": False,
-            "traffic_baseline_used_bytes": baseline_used,
-            "raw_used_bytes_cache": baseline_used,
-            "used_bytes_cache": 0,
-            "traffic_updated_at": now_utc(),
             "created_at": now_utc(),
             "updated_at": now_utc(),
         }
@@ -2687,83 +2621,6 @@ async def handle_admin_state_text(message: Message, state: str, data: Dict[str, 
     if state == "admin_broadcast":
         await broadcast_admin_message(message)
         return
-
-
-@dp.message(Command("fixtraffic"))
-async def on_fixtraffic_cmd(message: Message) -> None:
-    """
-    Admin tool:
-        /fixtraffic SUB_ID_OR_XUI_EMAIL
-
-    It resets the displayed usage of one subscription to 0 by saving the current
-    panel counter as baseline. Use it for configs that were already created
-    before this fix and have bad cached usage.
-    """
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].strip():
-        await message.answer(
-            "فرمت درست:\n"
-            "<code>/fixtraffic SUB_ID_OR_XUI_EMAIL</code>\n\n"
-            "مثال:\n"
-            "<code>/fixtraffic AzizVPN-testGig-9705-1cfx</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    key = parts[1].strip()
-
-    if ObjectId.is_valid(key):
-        query: Dict[str, Any] = {"_id": ObjectId(key)}
-    else:
-        query = {"xui_email": key}
-
-    sub = await subs_col.find_one(query)
-
-    if not sub and not ObjectId.is_valid(key):
-        sub = await subs_col.find_one({
-            "$or": [
-                {"xui_email": key},
-                {"display_name": key},
-                {"name": key},
-            ]
-        })
-
-    if not sub:
-        await message.answer("❌ اشتراک پیدا نشد.")
-        return
-
-    try:
-        raw_used = int(await xui.traffic_for_sub(sub) or 0)
-    except Exception as exc:
-        await message.answer(
-            "❌ خطا در خواندن مصرف از پنل:\n"
-            f"<code>{h(exc)}</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    await subs_col.update_one(
-        {"_id": sub["_id"]},
-        {
-            "$set": {
-                "traffic_baseline_used_bytes": raw_used,
-                "raw_used_bytes_cache": raw_used,
-                "used_bytes_cache": 0,
-                "traffic_updated_at": now_utc(),
-                "updated_at": now_utc(),
-            }
-        },
-    )
-
-    await message.answer(
-        "✅ مصرف این اشتراک ریست شد و از این به بعد از همین لحظه حساب می‌شود.\n\n"
-        f"اشتراک: <code>{h(sub.get('xui_email') or '-')}</code>\n"
-        f"Baseline: <code>{fmt_bytes(raw_used)}</code>",
-        parse_mode="HTML",
-    )
 
 
 # =====================================================
