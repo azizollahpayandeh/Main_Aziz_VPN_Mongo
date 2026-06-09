@@ -2816,8 +2816,6 @@ async def handle_admin_state_text(message: Message, state: str, data: Dict[str, 
 
 
 
-
-
 @dp.message(Command("fixtraffic"))
 async def on_fixtraffic_cmd(message: Message) -> None:
     """
@@ -2825,7 +2823,8 @@ async def on_fixtraffic_cmd(message: Message) -> None:
         /fixtraffic SUB_ID_OR_XUI_EMAIL
 
     It resets the displayed usage of one subscription to 0 by saving the current
-    panel counter as baseline. It also sets the subscription status to active.
+    panel counter as baseline. Use it for configs that were already created
+    before this fix and have bad cached usage.
     """
     if message.from_user.id != ADMIN_ID:
         return
@@ -2833,9 +2832,13 @@ async def on_fixtraffic_cmd(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip():
         await message.answer(
-            "فرمت درست:\n"
-            "<code>/fixtraffic SUB_ID_OR_XUI_EMAIL</code>\n\n"
-            "مثال:\n"
+            "فرمت درست:
+"
+            "<code>/fixtraffic SUB_ID_OR_XUI_EMAIL</code>
+
+"
+            "مثال:
+"
             "<code>/fixtraffic AzizVPN-testGig-9705-1cfx</code>",
             parse_mode="HTML",
         )
@@ -2867,7 +2870,8 @@ async def on_fixtraffic_cmd(message: Message) -> None:
         raw_used = int(await xui.traffic_for_sub(sub) or 0)
     except Exception as exc:
         await message.answer(
-            "❌ خطا در خواندن مصرف از پنل:\n"
+            "❌ خطا در خواندن مصرف از پنل:
+"
             f"<code>{h(exc)}</code>",
             parse_mode="HTML",
         )
@@ -2888,9 +2892,13 @@ async def on_fixtraffic_cmd(message: Message) -> None:
     )
 
     await message.answer(
-        "✅ مصرف این اشتراک ریست شد و وضعیت آن فعال شد.\n"
-        "از این به بعد مصرف از همین لحظه حساب می‌شود.\n\n"
-        f"اشتراک: <code>{h(sub.get('xui_email') or '-')}</code>\n"
+        "✅ مصرف این اشتراک ریست شد و وضعیت آن فعال شد.
+"
+        "از این به بعد مصرف از همین لحظه حساب می‌شود.
+
+"
+        f"اشتراک: <code>{h(sub.get('xui_email') or '-')}</code>
+"
         f"Baseline: <code>{fmt_bytes(raw_used)}</code>",
         parse_mode="HTML",
     )

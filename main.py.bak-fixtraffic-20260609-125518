@@ -2816,16 +2816,15 @@ async def handle_admin_state_text(message: Message, state: str, data: Dict[str, 
 
 
 
-
-
 @dp.message(Command("fixtraffic"))
 async def on_fixtraffic_cmd(message: Message) -> None:
     """
     Admin tool:
         /fixtraffic SUB_ID_OR_XUI_EMAIL
 
-    It resets the displayed usage of one subscription to 0 by saving the current
-    panel counter as baseline. It also sets the subscription status to active.
+    It resets displayed usage of one subscription to 0 by saving the current
+    3X-UI counter as baseline. It also re-activates a subscription that was
+    wrongly marked expired while it still has time and volume.
     """
     if message.from_user.id != ADMIN_ID:
         return
@@ -2833,18 +2832,22 @@ async def on_fixtraffic_cmd(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip():
         await message.answer(
-            "فرمت درست:\n"
-            "<code>/fixtraffic SUB_ID_OR_XUI_EMAIL</code>\n\n"
-            "مثال:\n"
+            "فرمت درست:
+"
+            "<code>/fixtraffic SUB_ID_OR_XUI_EMAIL</code>
+
+"
+            "مثال:
+"
             "<code>/fixtraffic AzizVPN-testGig-9705-1cfx</code>",
             parse_mode="HTML",
         )
         return
 
     key = parts[1].strip()
-
+    query: Dict[str, Any]
     if ObjectId.is_valid(key):
-        query: Dict[str, Any] = {"_id": ObjectId(key)}
+        query = {"_id": ObjectId(key)}
     else:
         query = {"xui_email": key}
 
@@ -2867,34 +2870,52 @@ async def on_fixtraffic_cmd(message: Message) -> None:
         raw_used = int(await xui.traffic_for_sub(sub) or 0)
     except Exception as exc:
         await message.answer(
-            "❌ خطا در خواندن مصرف از پنل:\n"
+            "❌ خطا در خواندن مصرف از پنل:
+"
             f"<code>{h(exc)}</code>",
             parse_mode="HTML",
         )
         return
 
-    await subs_col.update_one(
-        {"_id": sub["_id"]},
-        {
-            "$set": {
-                "status": "active",
-                "traffic_baseline_used_bytes": raw_used,
-                "raw_used_bytes_cache": raw_used,
-                "used_bytes_cache": 0,
-                "traffic_updated_at": now_utc(),
-                "updated_at": now_utc(),
-            }
-        },
+    expires_at = ensure_aware_dt(sub.get("expires_at"))
+    total = int(sub.get("total_bytes", 0) or 0)
+    should_be_active = (
+        sub.get("status") != "deleted"
+        and (not expires_at or expires_at > now_utc())
+        and total > 0
     )
+
+    set_doc: Dict[str, Any] = {
+        "traffic_baseline_used_bytes": raw_used,
+        "raw_used_bytes_cache": raw_used,
+        "used_bytes_cache": 0,
+        "traffic_updated_at": now_utc(),
+        "updated_at": now_utc(),
+    }
+    unset_doc: Dict[str, Any] = {}
+
+    if should_be_active:
+        set_doc["status"] = "active"
+        unset_doc["ended_at"] = ""
+        unset_doc["deleted_at"] = ""
+
+    update_doc: Dict[str, Any] = {"$set": set_doc}
+    if unset_doc:
+        update_doc["$unset"] = unset_doc
+
+    await subs_col.update_one({"_id": sub["_id"]}, update_doc)
 
     await message.answer(
-        "✅ مصرف این اشتراک ریست شد و وضعیت آن فعال شد.\n"
-        "از این به بعد مصرف از همین لحظه حساب می‌شود.\n\n"
-        f"اشتراک: <code>{h(sub.get('xui_email') or '-')}</code>\n"
-        f"Baseline: <code>{fmt_bytes(raw_used)}</code>",
+        "✅ مصرف این اشتراک ریست شد و از این به بعد از همین لحظه حساب می‌شود.
+
+"
+        f"اشتراک: <code>{h(sub.get('xui_email') or '-')}</code>
+"
+        f"Baseline: <code>{fmt_bytes(raw_used)}</code>
+"
+        f"وضعیت: <code>{'active' if should_be_active else h(sub.get('status') or '-')}</code>",
         parse_mode="HTML",
     )
-
 
 # =====================================================
 # Main

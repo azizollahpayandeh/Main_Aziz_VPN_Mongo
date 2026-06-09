@@ -467,47 +467,16 @@ def nav_rows(include_home: bool = True) -> List[List[InlineKeyboardButton]]:
     return rows
 
 
-def _sub_total_bytes(sub: Dict[str, Any]) -> int:
-    return int(sub.get("total_bytes", 0) or 0)
-
-
-def _sub_cached_used_bytes(sub: Dict[str, Any]) -> int:
-    return max(0, int(sub.get("used_bytes_cache", 0) or 0))
-
-
-def _sub_expired_by_time(sub: Dict[str, Any]) -> bool:
-    expires_at = ensure_aware_dt(sub.get("expires_at"))
-    return bool(expires_at and expires_at <= now_utc())
-
-
-def _normalize_used_with_baseline(sub: Dict[str, Any], raw_used: int) -> int:
-    """
-    3X-UI traffic counters are cumulative for the client.
-    traffic_baseline_used_bytes means: start counting from this raw counter.
-    This also protects old subscriptions that had a bad 68GB cached value.
-    """
-    raw_used = max(0, int(raw_used or 0))
-    baseline = max(0, int(sub.get("traffic_baseline_used_bytes", 0) or 0))
-    used = max(raw_used - baseline, 0)
-    return used
-
-
 def sub_is_active(sub: Dict[str, Any]) -> bool:
-    if sub.get("status") == "deleted":
+    if sub.get("status") != "active":
         return False
-    if _sub_expired_by_time(sub):
+    expires_at = ensure_aware_dt(sub.get("expires_at"))
+    if expires_at and expires_at <= now_utc():
         return False
-
-    total = _sub_total_bytes(sub)
-    used = _sub_cached_used_bytes(sub)
-    if total > 0 and used >= total:
-        return False
-
-    # Important fix:
-    # Some old rows were marked expired because a wrong cached traffic value
-    # came from the panel/API. If expiry is still in the future and remaining
-    # volume exists, treat it as active even if Mongo status is still "expired".
-    return str(sub.get("status") or "active") in ("active", "expired")
+    total = int(sub.get("total_bytes", 0) or 0)
+    if total > 0:
+        return True
+    return True
 
 
 def sub_status_line(sub: Dict[str, Any]) -> str:
@@ -543,71 +512,43 @@ def normalize_used_with_baseline(sub: Dict[str, Any], raw_used: int) -> Tuple[in
 
 async def sub_used_bytes(sub: Dict[str, Any]) -> int:
     """
-    Read client traffic from 3X-UI and cache the displayed usage in MongoDB.
+    Read usage from 3X-UI and cache it in MongoDB.
 
-    Fixes:
-    - Do not keep an old wrong 68GB cache forever.
-    - Use traffic_baseline_used_bytes for /fixtraffic resets.
-    - If a subscription was wrongly marked expired but still has time/volume,
-      automatically set it back to active.
+    Important fix:
+    - When 3X-UI is reachable, trust the current resolved client traffic.
+      Do NOT keep an old higher cache forever, because a previous bug could
+      cache the whole inbound traffic and show impossible values like
+      68 GB used on a fresh 15 GB plan.
+    - When 3X-UI is unavailable, show the last cached displayed usage.
     """
-    raw_opt = await xui.traffic_for_sub(sub)
-    cached = _sub_cached_used_bytes(sub)
+    raw_used_opt = await xui.traffic_for_sub(sub)
+    cached = int(sub.get("used_bytes_cache", 0) or 0)
 
-    if raw_opt is None:
-        used = cached
-        raw_used = int(sub.get("raw_used_bytes_cache", 0) or 0)
-    else:
-        raw_used = max(0, int(raw_opt or 0))
-        used = _normalize_used_with_baseline(sub, raw_used)
+    if raw_used_opt is None:
+        return cached
 
-        # Only trust old cache when there is no baseline and it is not obviously
-        # over the plan limit. Old bad caches like 68GB for a 15GB plan are ignored.
-        baseline = int(sub.get("traffic_baseline_used_bytes", 0) or 0)
-        total = _sub_total_bytes(sub)
-        if baseline <= 0 and cached > 0 and (total <= 0 or cached <= total):
-            used = max(used, cached)
-
-    total = _sub_total_bytes(sub)
-    expires_at = ensure_aware_dt(sub.get("expires_at"))
-    should_be_active = (
-        sub.get("status") != "deleted"
-        and (not expires_at or expires_at > now_utc())
-        and (total <= 0 or used < total)
-    )
+    used, raw_used, extra_patch = normalize_used_with_baseline(sub, int(raw_used_opt or 0))
 
     if sub.get("_id"):
-        set_doc: Dict[str, Any] = {
-            "raw_used_bytes_cache": raw_used,
+        patch = {
             "used_bytes_cache": used,
+            "raw_used_bytes_cache": raw_used,
             "traffic_updated_at": now_utc(),
             "updated_at": now_utc(),
+            **extra_patch,
         }
-        unset_doc: Dict[str, Any] = {}
-
-        if should_be_active and sub.get("status") != "active":
-            set_doc["status"] = "active"
-            unset_doc["ended_at"] = ""
-            unset_doc["deleted_at"] = ""
-            sub["status"] = "active"
-
-        update_doc: Dict[str, Any] = {"$set": set_doc}
-        if unset_doc:
-            update_doc["$unset"] = unset_doc
-
-        await subs_col.update_one({"_id": sub["_id"]}, update_doc)
-        sub.update(set_doc)
-        for key in unset_doc:
-            sub.pop(key, None)
+        await subs_col.update_one({"_id": sub["_id"]}, {"$set": patch})
+        sub.update(patch)
 
     return used
+
 
 async def sync_subscription_from_xui(sub: Dict[str, Any]) -> Dict[str, Any]:
     """
     Best-effort sync of Mongo subscription data from the panel.
 
-    It also repairs rows that were wrongly marked expired while 3X-UI still
-    shows valid remaining traffic and future duration.
+    This keeps total/expiry/uuid aligned, but usage is normalized by baseline
+    so a stale panel/inbound counter cannot be shown as a user's real usage.
     """
     email = str(sub.get("xui_email") or "").strip()
     if not email or not sub.get("_id"):
@@ -623,58 +564,33 @@ async def sync_subscription_from_xui(sub: Dict[str, Any]) -> Dict[str, Any]:
         return sub
 
     patch: Dict[str, Any] = {"updated_at": now_utc()}
-    unset_doc: Dict[str, Any] = {}
 
     total_bytes = int(snap.get("total_bytes") or 0)
     if total_bytes > 0:
         patch["total_bytes"] = total_bytes
         patch["volume_gb"] = int(round(total_bytes / (1024 ** 3)))
-    else:
-        total_bytes = _sub_total_bytes(sub)
 
     expiry_ms = int(snap.get("expiry_ms") or 0)
-    expires_at = ensure_aware_dt(sub.get("expires_at"))
     if expiry_ms > 0:
-        expires_at = ms_to_dt(expiry_ms)
-        patch["expires_at"] = expires_at
+        patch["expires_at"] = ms_to_dt(expiry_ms)
 
     if snap.get("uuid"):
         patch["uuid"] = snap["uuid"]
     if snap.get("sub_id"):
         patch["sub_id"] = snap["sub_id"]
 
-    used = _sub_cached_used_bytes(sub)
     if snap.get("traffic_found"):
-        raw_used = max(0, int(snap.get("used_bytes") or 0))
-        used = _normalize_used_with_baseline(sub, raw_used)
-        patch["raw_used_bytes_cache"] = raw_used
+        used, raw_used, extra_patch = normalize_used_with_baseline(sub, int(snap.get("used_bytes") or 0))
         patch["used_bytes_cache"] = used
+        patch["raw_used_bytes_cache"] = raw_used
         patch["traffic_updated_at"] = now_utc()
-
-    enable = snap.get("enable")
-    should_be_active = (
-        sub.get("status") != "deleted"
-        and enable is not False
-        and (not expires_at or expires_at > now_utc())
-        and (total_bytes <= 0 or used < total_bytes)
-    )
-
-    if should_be_active:
-        patch["status"] = "active"
-        unset_doc["ended_at"] = ""
-        unset_doc["deleted_at"] = ""
+        patch.update(extra_patch)
 
     if len(patch) > 1:
-        update_doc: Dict[str, Any] = {"$set": patch}
-        if unset_doc:
-            update_doc["$unset"] = unset_doc
-        await subs_col.update_one({"_id": sub["_id"]}, update_doc)
+        await subs_col.update_one({"_id": sub["_id"]}, {"$set": patch})
         sub.update(patch)
-        for key in unset_doc:
-            sub.pop(key, None)
 
     return sub
-
 
 
 def join_channel_kb() -> InlineKeyboardMarkup:
@@ -1785,51 +1701,12 @@ async def show_wallet(message: Message, user_id: int) -> None:
 
 
 async def show_subscriptions(message: Message, user_id: int) -> None:
-    docs = await subs_col.find(
-        {"user_id": int(user_id), "status": {"$in": ["active", "expired", "deleted"]}}
-    ).sort("created_at", DESCENDING).to_list(50)
-
-    fixed_docs: List[Dict[str, Any]] = []
-
-    for d in docs:
-        if d.get("status") not in ("active", "expired"):
-            continue
-
-        try:
-            d = await sync_subscription_from_xui(d)
-        except Exception as exc:
-            logger.warning("sync subscription in list failed for %s: %s", d.get("xui_email"), exc)
-
-        # If the subscription has time left and traffic left, repair wrong expired status.
-        total = int(d.get("total_bytes", 0) or 0)
-        used = int(d.get("used_bytes_cache", 0) or 0)
-        expires_at = ensure_aware_dt(d.get("expires_at"))
-
-        has_time = bool(expires_at and expires_at > now_utc())
-        has_volume = bool(total <= 0 or used < total)
-
-        if d.get("status") == "expired" and has_time and has_volume:
-            await subs_col.update_one(
-                {"_id": d["_id"]},
-                {"$set": {"status": "active", "updated_at": now_utc()}},
-            )
-            d["status"] = "active"
-
-        fixed_docs.append(d)
-
-    docs = fixed_docs
-
+    docs = await subs_col.find({"user_id": int(user_id), "status": {"$in": ["active", "expired", "deleted"]}}).sort("created_at", DESCENDING).to_list(50)
+    docs = [d for d in docs if d.get("status") in ("active", "expired")]
     if not docs:
-        await send_or_edit(
-            message,
-            "❌ در حال حاضر اکانت فعالی ندارید.\n"
-            "ابتدا از بخش «🛍 خرید اشتراک» یک اشتراک تهیه کنید.",
-            simple_back_kb(),
-        )
+        await send_or_edit(message, "❌ در حال حاضر اکانت فعالی ندارید.\nابتدا از بخش «🛍 خرید اشتراک» یک اشتراک تهیه کنید.", simple_back_kb())
         return
-
     active_n = sum(1 for d in docs if sub_is_active(d))
-
     lines = [
         "⚡️ <b>اشتراک‌های شما</b>",
         "",
@@ -1838,13 +1715,11 @@ async def show_subscriptions(message: Message, user_id: int) -> None:
         "برای مشاهده جزئیات و لینک اتصال، روی هر اشتراک بزنید:",
         "",
     ]
-
     for i, s in enumerate(docs, 1):
         used = await sub_used_bytes(s)
         total = int(s.get("total_bytes", 0) or 0)
         used_txt = fmt_bytes(used)
         total_txt = fmt_bytes(total) if total else f"{s.get('volume_gb', 0)} گیگ"
-
         lines.extend([
             "━━━━━━━━━━━━━━━━",
             f"<b>{i}.</b> {sub_status_line(s)}  ·  <b>{h(s.get('display_name') or s.get('name'))}</b>",
@@ -1853,7 +1728,6 @@ async def show_subscriptions(message: Message, user_id: int) -> None:
             f"📋 پلن: {h(s.get('plan_name') or '-')}",
             "",
         ])
-
     await send_or_edit(message, "\n".join(lines), subs_list_kb(docs))
 
 
@@ -2815,9 +2689,6 @@ async def handle_admin_state_text(message: Message, state: str, data: Dict[str, 
         return
 
 
-
-
-
 @dp.message(Command("fixtraffic"))
 async def on_fixtraffic_cmd(message: Message) -> None:
     """
@@ -2825,7 +2696,8 @@ async def on_fixtraffic_cmd(message: Message) -> None:
         /fixtraffic SUB_ID_OR_XUI_EMAIL
 
     It resets the displayed usage of one subscription to 0 by saving the current
-    panel counter as baseline. It also sets the subscription status to active.
+    panel counter as baseline. Use it for configs that were already created
+    before this fix and have bad cached usage.
     """
     if message.from_user.id != ADMIN_ID:
         return
@@ -2877,7 +2749,6 @@ async def on_fixtraffic_cmd(message: Message) -> None:
         {"_id": sub["_id"]},
         {
             "$set": {
-                "status": "active",
                 "traffic_baseline_used_bytes": raw_used,
                 "raw_used_bytes_cache": raw_used,
                 "used_bytes_cache": 0,
@@ -2888,12 +2759,48 @@ async def on_fixtraffic_cmd(message: Message) -> None:
     )
 
     await message.answer(
-        "✅ مصرف این اشتراک ریست شد و وضعیت آن فعال شد.\n"
-        "از این به بعد مصرف از همین لحظه حساب می‌شود.\n\n"
+        "✅ مصرف این اشتراک ریست شد و از این به بعد از همین لحظه حساب می‌شود.\n\n"
         f"اشتراک: <code>{h(sub.get('xui_email') or '-')}</code>\n"
         f"Baseline: <code>{fmt_bytes(raw_used)}</code>",
         parse_mode="HTML",
     )
+
+
+# =====================================================
+# Cleanup loop
+# =====================================================
+async def cleanup_loop() -> None:
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await cleanup_expired()
+        except Exception:
+            logger.exception("cleanup loop error")
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
+async def cleanup_expired() -> None:
+    now = now_utc()
+    async for sub in subs_col.find({"status": "active"}):
+        # Use the cached helper. If 3X-UI cannot answer at this moment, this
+        # prevents wrong volume decisions caused by fake zero traffic.
+        used = await sub_used_bytes(sub)
+        expires_at = ensure_aware_dt(sub.get("expires_at"))
+        expired_by_time = bool(expires_at and expires_at <= now)
+        expired_by_volume = used >= int(sub.get("total_bytes", 0)) > 0
+        if sub.get("is_trial") and (expired_by_time or expired_by_volume):
+            await xui.delete_client(sub["xui_email"])
+            await subs_col.update_one({"_id": sub["_id"]}, {"$set": {"status": "deleted", "ended_at": now, "deleted_at": now, "updated_at": now}})
+        elif (expired_by_time or expired_by_volume) and not sub.get("is_trial"):
+            await subs_col.update_one({"_id": sub["_id"]}, {"$set": {"status": "expired", "ended_at": now, "updated_at": now}})
+
+    delete_before = now - timedelta(days=10)
+    async for sub in subs_col.find({"status": "expired", "is_trial": {"$ne": True}}):
+        ended_at = ensure_aware_dt(sub.get("ended_at"))
+        if not ended_at or ended_at > delete_before:
+            continue
+        await xui.delete_client(sub["xui_email"])
+        await subs_col.update_one({"_id": sub["_id"]}, {"$set": {"status": "deleted", "deleted_at": now, "updated_at": now}})
 
 
 # =====================================================
