@@ -487,10 +487,7 @@ def sub_status_line(sub: Dict[str, Any]) -> str:
 
 
 async def sub_used_bytes(sub: Dict[str, Any]) -> int:
-    traffic = await xui.traffic(sub.get("xui_email"))
-    if not traffic:
-        return 0
-    return int(traffic.get("up", 0)) + int(traffic.get("down", 0))
+    return await xui.traffic_for_sub(sub)
 
 
 def join_channel_kb() -> InlineKeyboardMarkup:
@@ -753,12 +750,192 @@ class XUIClient:
             logger.warning("delete client failed for %s: %s", email, exc)
             return False
 
-    async def traffic(self, email: str) -> Optional[Dict[str, Any]]:
-        try:
-            data = await self.request("GET", f"/panel/api/clients/traffic/{quote(email, safe='')}")
-            return data.get("obj")
-        except Exception:
+    @staticmethod
+    def _parse_traffic_obj(obj: Any) -> Optional[Dict[str, Any]]:
+        if obj is None:
             return None
+        if isinstance(obj, list):
+            for item in obj:
+                parsed = XUIClient._parse_traffic_obj(item)
+                if parsed is not None:
+                    return parsed
+            return None
+        if not isinstance(obj, dict):
+            return None
+        data = obj.get("traffic") if isinstance(obj.get("traffic"), dict) else obj
+        total = int(data.get("total") or data.get("totalGB") or 0)
+        remaining = data.get("remaining", data.get("remainingTraffic"))
+        up = data.get("up", data.get("upload"))
+        down = data.get("down", data.get("download"))
+        if up is not None or down is not None:
+            return {
+                "up": int(up or 0),
+                "down": int(down or 0),
+                "total": total,
+            }
+        if remaining is not None and total > 0:
+            used = max(total - int(remaining), 0)
+            return {"up": used, "down": 0, "total": total}
+        return None
+
+    @staticmethod
+    def _extract_traffic_payload(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not data:
+            return None
+        parsed = XUIClient._parse_traffic_obj(data.get("obj"))
+        if parsed is not None:
+            return parsed
+        return XUIClient._parse_traffic_obj(data)
+
+    @staticmethod
+    def _find_traffic_in_tree(node: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+        if depth > 8:
+            return None
+        parsed = XUIClient._parse_traffic_obj(node)
+        if parsed is not None and XUIClient.traffic_used_bytes(parsed) > 0:
+            return parsed
+        if isinstance(node, dict):
+            for value in node.values():
+                found = XUIClient._find_traffic_in_tree(value, depth + 1)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = XUIClient._find_traffic_in_tree(item, depth + 1)
+                if found is not None:
+                    return found
+        return parsed if parsed is not None and depth == 0 else None
+
+    @staticmethod
+    def traffic_used_bytes(traffic: Optional[Dict[str, Any]]) -> int:
+        if not traffic:
+            return 0
+        return int(traffic.get("up", 0)) + int(traffic.get("down", 0))
+
+    @staticmethod
+    def _email_matches(candidate: Any, email: str) -> bool:
+        return str(candidate or "").lower() == str(email).lower()
+
+    async def _traffic_from_client_items(self, items: List[Dict[str, Any]], email: str) -> Optional[Dict[str, Any]]:
+        for item in items:
+            if self._email_matches(item.get("email"), email):
+                payload = self._parse_traffic_obj(item)
+                if payload is not None:
+                    return payload
+        return None
+
+    async def _traffic_from_inbound_stats(self, inbounds: List[Dict[str, Any]], email: str) -> Optional[Dict[str, Any]]:
+        for inbound in inbounds:
+            for stat in inbound.get("clientStats") or []:
+                if self._email_matches(stat.get("email"), email):
+                    payload = self._parse_traffic_obj(stat)
+                    if payload is not None:
+                        return payload
+        return None
+
+    async def traffic(self, email: str, inbound_id: int = INBOUND_ID) -> Optional[Dict[str, Any]]:
+        if not email:
+            return None
+        email = str(email).strip()
+        encoded = quote(email, safe="")
+        attempts: List[Tuple[str, str]] = [
+            ("clients.traffic", f"/panel/api/clients/traffic/{encoded}"),
+            ("inbounds.getClientTraffics", f"/panel/api/inbounds/getClientTraffics/{encoded}"),
+            ("clients.traffic.raw", f"/panel/api/clients/traffic/{email}"),
+        ]
+        for label, path in attempts:
+            try:
+                data = await self.request("GET", path)
+                payload = self._extract_traffic_payload(data)
+                if payload is not None:
+                    logger.info("traffic resolved via %s for %s: up=%s down=%s", label, email, payload.get("up"), payload.get("down"))
+                    return payload
+            except Exception as exc:
+                logger.warning("traffic fetch failed via %s for %s: %s", label, email, exc)
+
+        for label, path in (
+            ("clients.list.paged", f"/panel/api/clients/list/paged?search={encoded}&pageSize=20&page=1"),
+            ("clients.list", "/panel/api/clients/list"),
+        ):
+            try:
+                data = await self.request("GET", path)
+                obj = data.get("obj") or {}
+                items = obj.get("items") if isinstance(obj, dict) else obj
+                if not isinstance(items, list):
+                    items = []
+                payload = await self._traffic_from_client_items(items, email)
+                if payload is not None:
+                    logger.info("traffic resolved via %s for %s: up=%s down=%s", label, email, payload.get("up"), payload.get("down"))
+                    return payload
+            except Exception as exc:
+                logger.warning("traffic fetch failed via %s for %s: %s", label, email, exc)
+
+        try:
+            client_obj = await self.get_client(email)
+            payload = self._find_traffic_in_tree(client_obj)
+            if payload is not None:
+                logger.info("traffic resolved via clients.get for %s: up=%s down=%s", email, payload.get("up"), payload.get("down"))
+                return payload
+        except Exception as exc:
+            logger.warning("traffic fetch via clients.get failed for %s: %s", email, exc)
+
+        try:
+            inbounds = [await self.get_inbound(inbound_id)]
+            payload = await self._traffic_from_inbound_stats(inbounds, email)
+            if payload is not None:
+                logger.info("traffic resolved via inbounds.get for %s: up=%s down=%s", email, payload.get("up"), payload.get("down"))
+                return payload
+        except Exception as exc:
+            logger.warning("traffic fetch failed via inbounds.get for %s: %s", email, exc)
+
+        try:
+            data = await self.request("GET", "/panel/api/inbounds/list")
+            inbounds = data.get("obj") or []
+            payload = await self._traffic_from_inbound_stats(inbounds if isinstance(inbounds, list) else [inbounds], email)
+            if payload is not None:
+                logger.info("traffic resolved via inbounds.list for %s: up=%s down=%s", email, payload.get("up"), payload.get("down"))
+                return payload
+        except Exception as exc:
+            logger.warning("traffic fetch failed via inbounds.list for %s: %s", email, exc)
+
+        logger.warning("traffic data not found for %s after all fallbacks", email)
+        return None
+
+    async def traffic_for_sub(self, sub: Dict[str, Any]) -> int:
+        email = sub.get("xui_email")
+        keys = [email]
+        if sub.get("sub_id"):
+            keys.append(str(sub["sub_id"]))
+        seen = set()
+        for key in keys:
+            key = str(key or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if key == email:
+                traffic = await self.traffic(key)
+            else:
+                traffic = await self._traffic_by_search(key, email)
+            used = self.traffic_used_bytes(traffic)
+            if traffic is not None:
+                return used
+        return 0
+
+    async def _traffic_by_search(self, needle: str, email: str) -> Optional[Dict[str, Any]]:
+        encoded = quote(str(needle), safe="")
+        try:
+            data = await self.request("GET", f"/panel/api/clients/list/paged?search={encoded}&pageSize=20&page=1")
+            items = (data.get("obj") or {}).get("items") or []
+            payload = await self._traffic_from_client_items(items, email)
+            if payload is not None:
+                return payload
+            for item in items:
+                payload = self._parse_traffic_obj(item)
+                if payload is not None:
+                    return payload
+        except Exception as exc:
+            logger.warning("traffic search failed for %s: %s", needle, exc)
+        return None
 
     async def build_fallback_link(self, email: str, client_uuid: str, label: str, inbound_id: int) -> str:
         inbound = await self.get_inbound(inbound_id)
@@ -2089,10 +2266,7 @@ async def cleanup_loop() -> None:
 async def cleanup_expired() -> None:
     now = now_utc()
     async for sub in subs_col.find({"status": "active"}):
-        traffic = await xui.traffic(sub.get("xui_email"))
-        used = 0
-        if traffic:
-            used = int(traffic.get("up", 0)) + int(traffic.get("down", 0))
+        used = await xui.traffic_for_sub(sub)
         expires_at = ensure_aware_dt(sub.get("expires_at"))
         expired_by_time = bool(expires_at and expires_at <= now)
         expired_by_volume = used >= int(sub.get("total_bytes", 0)) > 0
