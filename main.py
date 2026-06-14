@@ -46,6 +46,7 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", f"tg://user?id={ADMIN_ID}").strip()
 CARD_NUMBER = os.getenv("CARD_NUMBER", "6037-0000-0000-0000").strip()
 CARD_HOLDER = os.getenv("CARD_HOLDER", "Azizollah").strip()
 BANK_NAME = os.getenv("BANK_NAME", "بانک").strip()
+SHOP_OPEN = (os.getenv("SHOP_OPEN") or os.getenv("SHOP_STATUS") or "yes").strip().lower()
 
 MIN_WALLET_CHARGE = int(os.getenv("MIN_WALLET_CHARGE", "200000"))
 MAX_WALLET_CHARGE = int(os.getenv("MAX_WALLET_CHARGE", "5000000"))
@@ -90,7 +91,6 @@ RENEW_VOLUME_OPTIONS = [15, 30, 50, 75, 100, 150, 200]
 FREE_TRIAL_BYTES = 100 * 1024 * 1024
 FREE_TRIAL_DAYS = 1
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "900"))
-SHOP_OPEN = os.getenv("SHOP_OPEN", "yes").strip().lower()
 
 SUB_NAME_RE = re.compile(r"^[A-Za-z0-9]{3,32}$")
 
@@ -3028,7 +3028,7 @@ async def main() -> None:
     logger.info("3X-UI connected. Inbound=%s port=%s", inbound.get("remark"), inbound.get("port"))
     await verify_channel_bot_setup()
     asyncio.create_task(cleanup_loop())
-    logger.info("Bot started: %s", BOT_BRAND)
+    logger.info("Bot started: %s | SHOP_OPEN=%s", BOT_BRAND, SHOP_OPEN)
     await dp.start_polling(bot)
 
 
