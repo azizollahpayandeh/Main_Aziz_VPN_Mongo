@@ -90,8 +90,15 @@ RENEW_VOLUME_OPTIONS = [15, 30, 50, 75, 100, 150, 200]
 FREE_TRIAL_BYTES = 100 * 1024 * 1024
 FREE_TRIAL_DAYS = 1
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "900"))
+SHOP_OPEN = os.getenv("SHOP_OPEN", "yes").strip().lower()
 
 SUB_NAME_RE = re.compile(r"^[A-Za-z0-9]{3,32}$")
+
+SHOP_CLOSED_TEXT = (
+    "🛒 <b>فروش اشتراک فعلاً بسته است.</b>\n\n"
+    "در حال حاضر امکان خرید اشتراک جدید وجود ندارد.\n"
+    "لطفاً بعداً دوباره تلاش کنید."
+)
 
 # =====================================================
 # MongoDB
@@ -516,6 +523,12 @@ def sub_status_line(sub: Dict[str, Any]) -> str:
     if sub.get("status") == "expired":
         return "🔴 <b>منقضی شده</b>"
     return f"⚪️ <b>{h(sub.get('status', 'نامشخص'))}</b>"
+
+
+def is_shop_open(user_id: Optional[int] = None) -> bool:
+    if user_id is not None and int(user_id) == ADMIN_ID:
+        return True
+    return SHOP_OPEN in ("yes", "true", "1", "on", "open")
 
 
 def normalize_used_with_baseline(sub: Dict[str, Any], raw_used: int) -> Tuple[int, int, Dict[str, Any]]:
@@ -1607,10 +1620,16 @@ async def render_nav_screen(message: Message, tg_user, screen: str) -> None:
         await send_or_edit(message, "📦 حجم تمدید را انتخاب کنید:", renew_volume_kb(sid))
         return
     if screen == "buy_name":
+        if not is_shop_open(uid):
+            await send_or_edit(message, SHOP_CLOSED_TEXT, simple_back_kb())
+            return
         await set_state(uid, "buy_name", {})
         await send_or_edit(message, "🖋 لطفا نام اشتراک خود را وارد کنید:\n\nمثال: <code>Aziz01</code>", simple_back_kb())
         return
     if screen == "buy_duration":
+        if not is_shop_open(uid):
+            await send_or_edit(message, SHOP_CLOSED_TEXT, simple_back_kb())
+            return
         _, data = await get_state(uid)
         auto = bool(data.get("auto_renew", False))
         await set_state(uid, "buy_duration", data)
@@ -1622,6 +1641,9 @@ async def render_nav_screen(message: Message, tg_user, screen: str) -> None:
         )
         return
     if screen.startswith("buy_plan:"):
+        if not is_shop_open(uid):
+            await send_or_edit(message, SHOP_CLOSED_TEXT, simple_back_kb())
+            return
         days = int(screen.split(":")[-1])
         _, data = await get_state(uid)
         await set_state(uid, "buy_plan", data)
@@ -1636,6 +1658,9 @@ async def render_nav_screen(message: Message, tg_user, screen: str) -> None:
         order = await orders_col.find_one({"_id": oid, "user_id": uid})
         if not order:
             await show_main(message, tg_user)
+            return
+        if order.get("kind") == "purchase" and not is_shop_open(uid):
+            await send_or_edit(message, SHOP_CLOSED_TEXT, simple_back_kb())
             return
         if order.get("kind") in ("renew_time", "renew_volume"):
             await send_or_edit(
@@ -1736,6 +1761,10 @@ async def cb_main(call: CallbackQuery) -> None:
         return
     action = call.data.split(":", 1)[1]
     await get_or_create_user(call.from_user)
+    if action == "buy" and not is_shop_open(call.from_user.id):
+        await call.answer("🛒 فروش اشتراک فعلاً بسته است.", show_alert=True)
+        await send_or_edit(call.message, SHOP_CLOSED_TEXT, simple_back_kb())
+        return
     await call.answer()
     if action == "buy":
         await nav_push(call.from_user.id, "buy_name")
@@ -1958,6 +1987,9 @@ async def cb_subs_newlink(call: CallbackQuery) -> None:
 # =====================================================
 @dp.callback_query(F.data == "buy:toggle_auto")
 async def cb_toggle_auto(call: CallbackQuery) -> None:
+    if not is_shop_open(call.from_user.id):
+        await call.answer("🛒 فروش اشتراک فعلاً بسته است.", show_alert=True)
+        return
     await call.answer()
     state, data = await get_state(call.from_user.id)
     data["auto_renew"] = not bool(data.get("auto_renew"))
@@ -1971,6 +2003,9 @@ async def cb_toggle_auto(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("buy:duration:"))
 async def cb_buy_duration(call: CallbackQuery) -> None:
+    if not is_shop_open(call.from_user.id):
+        await call.answer("🛒 فروش اشتراک فعلاً بسته است.", show_alert=True)
+        return
     await call.answer()
     days = int(call.data.split(":")[-1])
     state, data = await get_state(call.from_user.id)
@@ -1987,6 +2022,9 @@ async def cb_buy_duration(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("buy:plan:"))
 async def cb_buy_plan(call: CallbackQuery) -> None:
+    if not is_shop_open(call.from_user.id):
+        await call.answer("🛒 فروش اشتراک فعلاً بسته است.", show_alert=True)
+        return
     await call.answer()
     _, _, key, days_s = call.data.split(":")
     cb = f"{key}:{days_s}"
@@ -2037,6 +2075,9 @@ async def cb_pay_wallet(call: CallbackQuery) -> None:
     if not order or order.get("status") not in ("draft", "pending_receipt"):
         await call.answer("سفارش پیدا نشد یا قابل پرداخت نیست", show_alert=True)
         return
+    if order.get("kind") == "purchase" and not is_shop_open(call.from_user.id):
+        await call.answer("🛒 فروش اشتراک فعلاً بسته است.", show_alert=True)
+        return
     user = await users_col.find_one({"_id": int(call.from_user.id)}) or {"balance": 0}
     amount = int(order.get("amount", 0))
     if int(user.get("balance", 0)) < amount:
@@ -2080,6 +2121,9 @@ async def cb_pay_card(call: CallbackQuery) -> None:
     order = await orders_col.find_one({"_id": oid, "user_id": int(call.from_user.id)})
     if not order:
         await call.answer("سفارش پیدا نشد", show_alert=True)
+        return
+    if order.get("kind") == "purchase" and not is_shop_open(call.from_user.id):
+        await call.answer("🛒 فروش اشتراک فعلاً بسته است.", show_alert=True)
         return
     await orders_col.update_one({"_id": oid}, {"$set": {"payment_method": "card", "status": "pending_receipt", "updated_at": now_utc()}})
     await nav_push(call.from_user.id, f"payment:{oid}")
@@ -2167,6 +2211,10 @@ async def on_text(message: Message) -> None:
         return
 
     if state == "buy_name":
+        if not is_shop_open(message.from_user.id):
+            await clear_state(message.from_user.id)
+            await message.answer(SHOP_CLOSED_TEXT, reply_markup=simple_back_kb(), parse_mode="HTML")
+            return
         name = clean_sub_name(message.text)
         if not SUB_NAME_RE.fullmatch(name):
             await message.answer("❌ نام اشتراک باید حداقل 3 کاراکتر و فقط شامل حروف و اعداد انگلیسی باشد.\nمثال: <code>Aziz01</code>", parse_mode="HTML")
